@@ -1,0 +1,4 @@
+# 目前发现的问题
+1.除了例子中的CVE-2022-28805，其余测试CVE都无法加载出vulnerable_ref，只能加载出fixed_ref，感觉vulnerable_ref用fixed_ref的父提交就可以了
+
+2.二进制文件形式的poc模型无法识别，导致pocs这个文件夹为空
