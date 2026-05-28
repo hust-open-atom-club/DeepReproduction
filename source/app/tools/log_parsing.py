@@ -29,12 +29,14 @@ def extract_execution_observation(execution_logs: str) -> dict[str, Any]:
 
     stdout = extract_block(execution_logs, "stdout_begin", "stdout_end")
     stderr = extract_block(execution_logs, "stderr_begin", "stderr_end")
+    if not stderr:
+        stderr = _extract_outer_stderr(execution_logs)
     exit_code = None
     match = re.search(r"execution_exit_code=(\d+)", execution_logs)
     if match:
         exit_code = int(match.group(1))
     crash_type = ""
-    joined = f"{stdout}\n{stderr}".lower()
+    joined = f"{stdout}\n{stderr}\n{execution_logs}".lower()
     for marker in ("segmentation fault", "assert", "abort", "heap-buffer-overflow", "stack-overflow"):
         if marker in joined:
             crash_type = marker
@@ -45,6 +47,23 @@ def extract_execution_observation(execution_logs: str) -> dict[str, Any]:
         "observed_stderr": stderr,
         "observed_crash_type": crash_type,
     }
+
+
+def _extract_outer_stderr(execution_logs: str) -> str:
+    """Extract stderr-like outer sections when the script contract stderr block is empty."""
+
+    for begin, end in (
+        ("[container_run_stderr]\n", None),
+        ("=== stderr ===\n", None),
+    ):
+        start = execution_logs.find(begin)
+        if start == -1:
+            continue
+        content = execution_logs[start + len(begin) :]
+        if end and end in content:
+            content = content.split(end, 1)[0]
+        return content.strip()
+    return ""
 
 
 def match_patterns(haystack: str, patterns: list[str]) -> list[str]:

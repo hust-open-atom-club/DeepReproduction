@@ -583,6 +583,51 @@ def test_extract_execution_observation_parses_log_blocks():
     assert parsed["observed_crash_type"] == "segmentation fault"
 
 
+def test_extract_execution_observation_falls_back_to_outer_stderr_section():
+    stage = poc_module.PocStage()
+    logs = (
+        "container_run_success=True\n"
+        "container_run_exit_code=0\n"
+        "[container_run_stdout]\n"
+        "execution_exit_code=139\n"
+        "stdout_begin\n"
+        "stdout_end\n"
+        "stderr_begin\n"
+        "stderr_end\n"
+        "[container_run_stderr]\n"
+        "Segmentation fault (core dumped)\n"
+    )
+
+    parsed = stage._extract_execution_observation(logs)
+
+    assert parsed["observed_exit_code"] == 139
+    assert "Segmentation fault" in parsed["observed_stderr"]
+    assert parsed["observed_crash_type"] == "segmentation fault"
+
+
+def test_build_run_verify_report_accepts_signal_exit_as_verify_eligible():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(expected_crash_type="", expected_exit_code=None)
+    observation = {
+        "observed_exit_code": 139,
+        "observed_stdout": "",
+        "observed_stderr": "",
+        "observed_crash_type": "",
+    }
+
+    report = stage._build_run_verify_report(
+        plan=plan,
+        observation=observation,
+        execution_logs="execution_exit_code=139\nstdout_begin\nstdout_end\nstderr_begin\nstderr_end\n",
+        matched_error_patterns=[],
+        matched_stdout_patterns=[],
+        matched_stack_keywords=[],
+    )
+
+    assert report.eligible_for_verify is True
+    assert report.eligibility_reason == "signal_exit_observed: 139"
+
+
 def test_execute_poc_plan_writes_files_and_returns_artifact(tmp_path):
     class FakeDockerTool:
         def build_image(self, request):
