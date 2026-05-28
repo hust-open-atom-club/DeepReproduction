@@ -265,6 +265,7 @@ class VerifyStage:
     ) -> VerifyPreparedRun:
         """Collect deterministic verify inputs before any planning starts."""
 
+        self._ensure_verify_inputs(paths, build)
         context = self.collect_verify_context(
             knowledge, build, poc, paths, dataset_root=dataset_root
         )
@@ -274,6 +275,15 @@ class VerifyStage:
             "verify_context.yaml",
         )
         return VerifyPreparedRun(context=context)
+
+    def _ensure_verify_inputs(self, paths: VerifyStagePaths, build: BuildArtifact) -> None:
+        """Materialize minimal build artifacts required by verify when the workspace is incomplete."""
+
+        self.file_tool.ensure_dir(str(paths.build_dir))
+        build_script_path = paths.build_dir / "build.sh"
+        if not build_script_path.exists() and build.build_script_content:
+            content = build.build_script_content.rstrip() + "\n"
+            self.file_tool.write_text(str(build_script_path), content)
 
     def plan_and_execute_verify(
         self,
@@ -555,7 +565,7 @@ class VerifyStage:
             description=f"{mode}_patch.log",
         )
 
-        observation = extract_execution_observation(docker_result.stdout)
+        observation = extract_execution_observation(full_log)
         # Stream-aware matching: stdout patterns only in stdout, stderr patterns only in stderr.
         # Stack keywords still searched in the merged text (stack frames may land on either stream).
         matched_stdout_patterns = match_patterns(observation["observed_stdout"], plan.expected_stdout_patterns)
@@ -566,13 +576,13 @@ class VerifyStage:
         )
 
         required_markers = ("stdout_begin", "stdout_end", "stderr_begin", "stderr_end")
-        log_well_formed = all(marker in docker_result.stdout for marker in required_markers)
-        script_finished = "execution_exit_code=" in docker_result.stdout
+        log_well_formed = all(marker in full_log for marker in required_markers)
+        script_finished = "execution_exit_code=" in full_log
 
         patch_apply_exit_code = (
-            self._parse_patch_apply_exit_code(docker_result.stdout) if mode == "post" else None
+            self._parse_patch_apply_exit_code(full_log) if mode == "post" else None
         )
-        build_rebuild_exit_code = self._parse_build_rebuild_exit_code(docker_result.stdout)
+        build_rebuild_exit_code = self._parse_build_rebuild_exit_code(full_log)
 
         return {
             "exit_code": observation["observed_exit_code"],
@@ -683,6 +693,12 @@ class VerifyStage:
                 "failed",
                 "short_circuit:pre_not_triggered",
                 "PoC executed cleanly with no expected behavior observed; verify agrees.",
+            )
+        if run_verify_reason.startswith("signal_exit_observed"):
+            return (
+                "inconclusive",
+                "short_circuit:signal_exit_observed",
+                "PoC observed a crash-like signal exit; verify should not conclude pre_not_triggered from that alone.",
             )
         return (
             "inconclusive",

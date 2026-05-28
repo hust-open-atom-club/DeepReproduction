@@ -1636,6 +1636,8 @@ class PocStage:
         else:
             exit_code_match_expected = (exit_code_observed == plan.expected_exit_code)
 
+        signal_exit_observed = exit_code_observed in {134, 139}
+
         # 3.9 eligible_for_verify
         eligible_for_verify = False
         eligibility_reason = ""
@@ -1660,6 +1662,9 @@ class PocStage:
             elif exit_code_match_expected is True:
                 eligible_for_verify = True
                 eligibility_reason = f"exit_code_match: {exit_code_observed}"
+            elif signal_exit_observed:
+                eligible_for_verify = True
+                eligibility_reason = f"signal_exit_observed: {exit_code_observed}"
             else:
                 eligible_for_verify = False
                 eligibility_reason = "no_target_behavior_observed"

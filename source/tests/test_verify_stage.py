@@ -60,6 +60,30 @@ def test_prepare_verify_run_prefers_compiled_image_tag(tmp_path):
     assert context.docker_image_tag == "demo:compiled"
 
 
+def test_prepare_verify_run_materializes_missing_build_script(tmp_path):
+    stage = verify_module.VerifyStage()
+    workspace = tmp_path / "ws"
+    paths = verify_module.VerifyStagePaths(str(workspace))
+    paths.verify_dir.mkdir(parents=True, exist_ok=True)
+    paths.poc_dir.mkdir(parents=True, exist_ok=True)
+    (paths.poc_dir / "run_verify.yaml").write_text("eligible_for_verify: true\n", encoding="utf-8")
+
+    knowledge = KnowledgeModel(cve_id="CVE-2022-0000", summary="demo", vulnerability_type="heap")
+    build = BuildArtifact(
+        dockerfile_content="FROM ubuntu:20.04\n",
+        build_script_content="#!/bin/bash\necho rebuild\n",
+        build_success=True,
+        build_logs="ok",
+        docker_image_tag="demo:build",
+    )
+    poc = PoCArtifact(poc_filename="poc.txt", poc_content="x", run_script_content="#!/bin/bash\n")
+
+    stage.prepare_verify_run(knowledge, build, poc, paths)
+
+    assert (paths.build_dir / "build.sh").exists()
+    assert "echo rebuild" in (paths.build_dir / "build.sh").read_text(encoding="utf-8")
+
+
 def make_pass(
     exit_code=139,
     stdout="",
@@ -274,6 +298,19 @@ def test_short_circuit_unknown_reason_falls_back_to_inconclusive(tmp_path, monke
     assert "unknown_eligibility_reason" in result.reason
 
 
+def test_short_circuit_signal_exit_observed_to_inconclusive(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    workspace, knowledge, build, poc, fake_docker = _setup_short_circuit_workspace(
+        tmp_path, eligibility_reason="signal_exit_observed: 139"
+    )
+    stage = verify_module.VerifyStage(docker_tool=fake_docker)
+    result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=str(workspace))
+
+    assert result.verdict == "inconclusive"
+    assert result.reason == "short_circuit:signal_exit_observed"
+    assert fake_docker.run_container.call_count == 0
+
+
 def test_short_circuit_patch_diff_not_found_unchanged(tmp_path, monkeypatch):
     """patch.diff 缺失时短路保持 inconclusive，不依赖 run_verify。"""
 
@@ -356,6 +393,46 @@ def test_run_one_pass_parses_pre_log_correctly(tmp_path):
     assert result["build_rebuild_exit_code"] == 0
     assert "heap-buffer-overflow" in result["matched_error_patterns"]
     assert "singlevar" in result["matched_stack_keywords"]
+
+
+def test_run_one_pass_uses_outer_stderr_for_crash_detection(tmp_path):
+    workspace = tmp_path / "ws"
+    paths = verify_module.VerifyStagePaths(str(workspace))
+    paths.verify_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_docker_result = MagicMock()
+    fake_docker_result.stdout = (
+        "build_rebuild_exit_code=0\n"
+        "target_binary=src/lua\n"
+        "trigger_command=src/lua poc.lua\n"
+        "execution_exit_code=139\n"
+        "stdout_begin\n\nstdout_end\n"
+        "stderr_begin\n\nstderr_end\n"
+    )
+    fake_docker_result.stderr = "Segmentation fault (core dumped)\n"
+    fake_docker_result.exit_code = 0
+    fake_docker_result.success = True
+
+    fake_docker = MagicMock()
+    fake_docker.run_container = MagicMock(return_value=fake_docker_result)
+    stage = verify_module.VerifyStage(docker_tool=fake_docker)
+
+    context = make_context(expected_stderr_patterns=["Segmentation fault"], expected_crash_type="segmentation fault")
+    plan = verify_module.VerifyPlan(
+        image_tag="demo:build",
+        pre_run_command="src/lua poc.lua",
+        post_run_command="src/lua poc.lua",
+        expected_stderr_patterns=["Segmentation fault"],
+        expected_crash_type="segmentation fault",
+        pre_log_path=str(paths.pre_patch_log),
+        post_log_path=str(paths.post_patch_log),
+    )
+
+    result = stage._run_one_pass("pre", context, plan, paths)
+
+    assert result["exit_code"] == 139
+    assert result["crash_type"] == "segmentation fault"
+    assert "Segmentation fault" in result["matched_error_patterns"]
 
 
 # ===== Case 8 =====
