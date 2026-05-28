@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from pathlib import Path
@@ -29,7 +30,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from app.config import build_chat_model
 from app.schemas.build_artifact import BuildArtifact
-from app.schemas.knowledge import KnowledgeModel
+from app.schemas.knowledge import KnowledgeModel, ReproductionRecipe
 from app.schemas.poc_artifact import PoCArtifact
 from app.stages.build import parse_llm_json_payload
 from app.tools.docker_tools import DockerBuildRequest, DockerRunRequest, DockerTool
@@ -83,6 +84,7 @@ class PocContext(BaseModel):
     inferred_input_modes: list[str] = Field(default_factory=list, description="Likely trigger input modes inferred from evidence.")
     knowledge_summary: str = Field(default="", description="Knowledge summary.")
     reproduction_hints: list[str] = Field(default_factory=list, description="Reproduction hints from knowledge.")
+    reproduction_recipe_summaries: list[str] = Field(default_factory=list, description="Structured reproduction recipe summaries.")
     expected_error_patterns: list[str] = Field(default_factory=list, description="Expected error patterns.")
     expected_stack_keywords: list[str] = Field(default_factory=list, description="Expected stack keywords.")
     candidate_entrypoints: list[str] = Field(default_factory=list, description="Candidate entrypoints.")
@@ -448,11 +450,12 @@ class PocStage:
         candidate_entrypoints = [item for item in [build.binary_or_entrypoint, build.expected_binary_path] if item]
         candidate_entrypoints.extend(self._discover_candidate_binaries(paths.repo_dir))
         trigger_files = patch_affected_files or list(knowledge.affected_files)
-        cli_flags = self._extract_candidate_cli_flags(knowledge.reproduction_hints)
+        reproduction_recipe_summaries = self._summarize_reproduction_recipes(knowledge.reproduction_recipes)
+        cli_flags = self._extract_candidate_cli_flags(knowledge.reproduction_hints + reproduction_recipe_summaries)
         reference_poc_summaries = self._collect_reference_poc_summaries(knowledge.cve_id)
         repo_evidence_blocks = self._collect_repo_evidence(paths.repo_dir, trigger_files)
         inferred_input_modes = self._infer_input_modes(
-            hints=knowledge.reproduction_hints,
+            hints=knowledge.reproduction_hints + reproduction_recipe_summaries,
             patch_diff_text=patch_diff_text,
             reference_poc_summaries=reference_poc_summaries,
         )
@@ -472,6 +475,7 @@ class PocStage:
             inferred_input_modes=inferred_input_modes,
             knowledge_summary=knowledge.summary,
             reproduction_hints=list(knowledge.reproduction_hints),
+            reproduction_recipe_summaries=reproduction_recipe_summaries,
             expected_error_patterns=list(knowledge.expected_error_patterns),
             expected_stack_keywords=list(knowledge.expected_stack_keywords),
             candidate_entrypoints=sorted(set(candidate_entrypoints)),
@@ -542,8 +546,14 @@ class PocStage:
         source_of_truth = "heuristic"
         rationale = "Fallback PoC generated from knowledge hints and build artifact."
         confidence = "medium"
-
-        if reference_poc is not None:
+        recipe_plan = self._materialize_recipe_plan(knowledge.reproduction_recipes)
+        if recipe_plan is not None:
+            payload_filename = recipe_plan["payload_filename"]
+            payload_content = recipe_plan["payload_content"]
+            source_of_truth = "reproduction_recipe"
+            rationale = "Materialized the payload and trigger from a reproduction recipe preserved in knowledge."
+            confidence = recipe_plan["confidence"]
+        elif reference_poc is not None:
             payload_filename = reference_poc[0]
             payload_content = reference_poc[1]
             source_of_truth = "dataset_poc"
@@ -551,7 +561,16 @@ class PocStage:
             confidence = "high"
 
         target_binary = self._select_target_binary(build, context, payload_filename)
-        target_args = self._select_target_args(knowledge, payload_filename, context, target_binary)
+        target_args = self._select_target_args(
+            knowledge,
+            payload_filename,
+            context,
+            target_binary,
+            recipe_run_command=recipe_plan["run_command"] if recipe_plan is not None else "",
+        )
+        run_command = self._build_run_command(target_binary, target_args)
+        if recipe_plan is not None and recipe_plan["run_command"]:
+            run_command = self._normalize_recipe_run_command(recipe_plan["run_command"], payload_filename)
 
         return PocFallbackSpec(
             trigger_mode=self._infer_trigger_mode(payload_filename, context),
@@ -559,7 +578,7 @@ class PocStage:
             target_args=target_args,
             payload_filename=payload_filename,
             payload_content=payload_content,
-            run_command=self._build_run_command(target_binary, target_args),
+            run_command=run_command,
             expected_stdout_patterns=[],
             expected_stderr_patterns=list(knowledge.expected_error_patterns),
             expected_stack_keywords=list(knowledge.expected_stack_keywords),
@@ -643,6 +662,8 @@ class PocStage:
             f"Expected error patterns: {json.dumps(knowledge.expected_error_patterns, ensure_ascii=False)}",
             f"Expected stack keywords: {json.dumps(knowledge.expected_stack_keywords, ensure_ascii=False)}",
             f"Reproduction hints: {json.dumps(knowledge.reproduction_hints, ensure_ascii=False)}",
+            "Structured reproduction recipes:",
+            "\n\n---\n\n".join(context.reproduction_recipe_summaries[:4]) or "<empty>",
             f"Candidate entrypoints: {json.dumps(context.candidate_entrypoints, ensure_ascii=False)}",
             f"Candidate CLI flags: {json.dumps(context.candidate_cli_flags, ensure_ascii=False)}",
             f"Candidate trigger files: {json.dumps(context.candidate_trigger_files, ensure_ascii=False)}",
@@ -1103,6 +1124,25 @@ class PocStage:
             flags.extend(re.findall(r"(--?[A-Za-z0-9][A-Za-z0-9_-]*)", hint))
         return sorted(set(flags))
 
+    def _summarize_reproduction_recipes(self, recipes: list[ReproductionRecipe]) -> list[str]:
+        summaries: list[str] = []
+        for recipe in recipes[:4]:
+            payload = {
+                "source_url": recipe.source_url,
+                "source_title": recipe.source_title,
+                "recipe_type": recipe.recipe_type,
+                "steps": recipe.steps,
+                "repo_setup_commands": recipe.repo_setup_commands,
+                "build_commands": recipe.build_commands,
+                "artifact_generation_commands": recipe.artifact_generation_commands,
+                "run_commands": recipe.run_commands,
+                "expected_behavior": recipe.expected_behavior,
+                "source_excerpt": self._truncate_text(recipe.source_excerpt, self.REFERENCE_POC_SUMMARY_CHAR_LIMIT),
+                "confidence": recipe.confidence,
+            }
+            summaries.append(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True).strip())
+        return summaries
+
     def _extract_patch_metadata(self, patch_diff_text: str) -> dict[str, list[str]]:
         changed_functions = sorted(set(re.findall(r"^@@ .*? ([A-Za-z_][A-Za-z0-9_]*)\s*\(", patch_diff_text, re.MULTILINE)))
         added_checks = sorted(
@@ -1222,6 +1262,84 @@ class PocStage:
                     return path.name, path.read_text(encoding="utf-8", errors="replace")
         return None
 
+    def _materialize_recipe_plan(self, recipes: list[ReproductionRecipe]) -> Optional[dict[str, str]]:
+        for recipe in recipes:
+            if not recipe.steps:
+                continue
+            payload = self._payload_from_recipe(recipe)
+            if payload is None:
+                continue
+            return {
+                "payload_filename": payload["payload_filename"],
+                "payload_content": payload["payload_content"],
+                "run_command": self._select_recipe_run_command(recipe, payload["payload_filename"]),
+                "confidence": recipe.confidence or "medium",
+            }
+        return None
+
+    def _payload_from_recipe(self, recipe: ReproductionRecipe) -> Optional[dict[str, str]]:
+        commands = list(recipe.artifact_generation_commands) or list(recipe.steps)
+        for command in commands:
+            parsed = self._decode_base64_payload_command(command)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _decode_base64_payload_command(self, command: str) -> Optional[dict[str, str]]:
+        match = re.search(
+            r'echo\s+-n\s+"(?P<data>[A-Za-z0-9+/=]+)"\s*\|\s*base64\s+-d\s*>\s*(?P<name>[A-Za-z0-9._/-]+)',
+            command,
+        )
+        if not match:
+            return None
+        try:
+            decoded = base64.b64decode(match.group("data"), validate=True).decode("utf-8")
+        except Exception:
+            return None
+        filename = Path(match.group("name")).name or "poc.txt"
+        if not decoded.endswith("\n"):
+            decoded += "\n"
+        return {
+            "payload_filename": filename,
+            "payload_content": decoded,
+        }
+
+    def _select_recipe_run_command(self, recipe: ReproductionRecipe, payload_filename: str) -> str:
+        payload_tokens = {payload_filename, f"./{payload_filename}", "{payload}"}
+        preferred: list[str] = []
+        fallback: list[str] = []
+        for command in list(recipe.run_commands) + list(recipe.steps):
+            normalized = (command or "").strip()
+            if not self._looks_like_recipe_command(normalized):
+                continue
+            if any(token in normalized for token in payload_tokens):
+                preferred.append(normalized)
+            else:
+                fallback.append(normalized)
+        if preferred:
+            return preferred[-1]
+        if fallback:
+            return fallback[-1]
+        return ""
+
+    def _looks_like_recipe_command(self, command: str) -> bool:
+        lowered = (command or "").strip().lower()
+        if not lowered or lowered.endswith(":"):
+            return False
+        command_prefixes = (
+            "./",
+            "/",
+            "lua ",
+            "python ",
+            "python3 ",
+            "perl ",
+            "ruby ",
+            "node ",
+            "bash ",
+            "sh ",
+        )
+        return lowered.startswith(command_prefixes)
+
     def _select_target_binary(self, build: BuildArtifact, context: PocContext, payload_filename: str = "") -> str:
         if build.binary_or_entrypoint:
             return self._normalize_target_binary(build.binary_or_entrypoint, context.repo_url)
@@ -1234,8 +1352,20 @@ class PocStage:
             return self._normalize_target_binary(context.candidate_entrypoints[0], context.repo_url)
         return "./target"
 
-    def _select_target_args(self, knowledge: KnowledgeModel, payload_filename: str, context: PocContext, target_binary: str) -> list[str]:
+    def _select_target_args(
+        self,
+        knowledge: KnowledgeModel,
+        payload_filename: str,
+        context: PocContext,
+        target_binary: str,
+        recipe_run_command: str = "",
+    ) -> list[str]:
         payload_path = f"/workspace/artifacts/poc/payloads/{payload_filename}"
+        if recipe_run_command:
+            normalized_command = self._normalize_run_command(recipe_run_command, payload_filename, context.repo_url)
+            parts = normalized_command.split()
+            if parts and self._looks_like_binary(parts[0].strip("'\""), target_binary):
+                return parts[1:]
         for hint in knowledge.reproduction_hints:
             if "{payload}" in hint:
                 hint = hint.replace("{payload}", payload_path)
@@ -1261,6 +1391,13 @@ class PocStage:
         segments = [self._shell_quote(target_binary)]
         segments.extend(self._shell_quote(item) for item in target_args)
         return " ".join(item for item in segments if item).strip()
+
+    def _normalize_recipe_run_command(self, run_command: str, payload_filename: str) -> str:
+        payload_path = f"/workspace/artifacts/poc/payloads/{payload_filename}"
+        normalized = run_command.replace("{payload}", payload_path)
+        for candidate in (f"./{payload_filename}", payload_filename):
+            normalized = re.sub(rf"(?<!\S){re.escape(candidate)}(?!\S)", payload_path, normalized)
+        return normalized
 
     def _infer_expected_crash_type(self, knowledge: KnowledgeModel) -> str:
         joined = " ".join(knowledge.expected_error_patterns + knowledge.reproduction_hints).lower()

@@ -9,6 +9,22 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+class ReproductionRecipe(BaseModel):
+    """Structured reproduction recipe extracted from evidence."""
+
+    source_url: str = Field(default="", description="Source URL that contained the reproduction evidence.")
+    source_title: str = Field(default="", description="Page title for the evidence source.")
+    recipe_type: str = Field(default="unknown", description="Recipe style such as shell_sequence or mixed.")
+    steps: List[str] = Field(default_factory=list, description="Ordered reproduction steps preserved from the evidence.")
+    repo_setup_commands: List[str] = Field(default_factory=list, description="Repository setup commands such as clone or checkout.")
+    build_commands: List[str] = Field(default_factory=list, description="Commands used to compile or build the target.")
+    artifact_generation_commands: List[str] = Field(default_factory=list, description="Commands that generate payloads or helper files.")
+    run_commands: List[str] = Field(default_factory=list, description="Commands that execute the reproducer against the target.")
+    expected_behavior: List[str] = Field(default_factory=list, description="Expected crash signatures or observable behavior.")
+    source_excerpt: str = Field(default="", description="Original evidence excerpt used to derive this recipe.")
+    confidence: str = Field(default="medium", description="Confidence level assigned to the extraction.")
+
+
 class KnowledgeModel(BaseModel):
     """漏洞知识的结构化表达。"""
 
@@ -25,6 +41,7 @@ class KnowledgeModel(BaseModel):
     build_commands: List[str] = Field(default_factory=list, description="从证据中提取的编译或构建命令。")
     build_hints: List[str] = Field(default_factory=list, description="与构建过程相关的提炼提示。")
     reproduction_hints: List[str] = Field(default_factory=list, description="复现提示信息")
+    reproduction_recipes: List[ReproductionRecipe] = Field(default_factory=list, description="从网页原文中提取并保留的结构化复现流程。")
     expected_error_patterns: List[str] = Field(default_factory=list, description="预期报错模式")
     expected_stack_keywords: List[str] = Field(default_factory=list, description="预期栈关键词")
     references: List[str] = Field(default_factory=list, description="知识阶段保留的参考资料")

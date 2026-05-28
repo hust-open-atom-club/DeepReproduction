@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from app.schemas.build_artifact import BuildArtifact
-from app.schemas.knowledge import KnowledgeModel
+from app.schemas.knowledge import KnowledgeModel, ReproductionRecipe
 from app.schemas.poc_artifact import PoCArtifact
 from app.stages import poc as poc_module
 
@@ -176,6 +176,37 @@ def test_initial_prompt_uses_compact_reference_poc_summary():
     assert "CONTENT:" not in prompt
 
 
+def test_prompt_includes_structured_reproduction_recipes():
+    stage = poc_module.PocStage()
+    knowledge = make_knowledge(
+        reproduction_recipes=[
+            ReproductionRecipe(
+                source_url="https://example.com/advisory",
+                source_title="Advisory",
+                steps=["git clone https://example.com/repo", "./demo {payload}"],
+                run_commands=["./demo {payload}"],
+                source_excerpt="How to reproduce:\n1. git clone ...\n2. ./demo payload",
+            )
+        ]
+    )
+    build = make_build()
+    context = poc_module.PocContext(
+        cve_id=knowledge.cve_id,
+        reproduction_recipe_summaries=["steps:\n- git clone https://example.com/repo\n- ./demo {payload}"],
+    )
+
+    prompt = stage._build_llm_prompt(
+        knowledge=knowledge,
+        build=build,
+        context=context,
+        previous_plan=None,
+        previous_artifact=None,
+    )
+
+    assert "Structured reproduction recipes:" in prompt
+    assert "./demo {payload}" in prompt
+
+
 def test_plan_poc_falls_back_when_llm_unavailable(monkeypatch):
     monkeypatch.setattr(poc_module, "build_chat_model", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("missing key")))
 
@@ -188,6 +219,63 @@ def test_plan_poc_falls_back_when_llm_unavailable(monkeypatch):
 
     assert plan.target_binary == "demo-bin"
     assert plan.source_of_truth in {"heuristic", "dataset_poc"}
+
+
+def test_heuristic_plan_prefers_reproduction_recipe_payload_over_dataset_poc():
+    stage = poc_module.PocStage()
+    knowledge = make_knowledge(
+        repo_url="https://github.com/lua/lua.git",
+        reproduction_recipes=[
+            ReproductionRecipe(
+                source_url="https://osv.dev/reference",
+                source_title="OSV reference",
+                steps=[
+                    "git clone https://github.com/lua/lua -q",
+                    "cd lua/ && make -j$(nproc)",
+                    'echo -n "cHJpbnQoJ29rJyk=" | base64 -d > poc.lua',
+                    "./lua ./poc.lua",
+                ],
+                artifact_generation_commands=['echo -n "cHJpbnQoJ29rJyk=" | base64 -d > poc.lua'],
+                run_commands=["./lua ./poc.lua"],
+                source_excerpt="How to reproduce...",
+                confidence="high",
+            )
+        ],
+    )
+    build = make_build(binary_or_entrypoint="lua")
+    context = poc_module.PocContext(cve_id=knowledge.cve_id, repo_url="https://github.com/lua/lua.git")
+
+    plan = stage._normalize_poc_plan(
+        stage._heuristic_poc_plan(knowledge=knowledge, build=build, context=context),
+        repo_url=knowledge.repo_url or "",
+    )
+
+    assert plan.source_of_truth == "reproduction_recipe"
+    assert plan.payload_filename == "poc.lua"
+    assert plan.payload_content == "print('ok')\n"
+    assert plan.target_binary == "/src/lua/lua"
+    assert plan.run_command == "'/src/lua/lua' /workspace/artifacts/poc/payloads/poc.lua"
+
+
+def test_recipe_run_command_selection_ignores_non_command_noise():
+    stage = poc_module.PocStage()
+    recipe = ReproductionRecipe(
+        steps=[
+            "Lua version:",
+            "Lua 5.4.4 Copyright (C) 1994-2022 Lua.org, PUC-Rio",
+            "git clone https://github.com/lua/lua -q",
+            "./lua ./poc",
+        ],
+        run_commands=[
+            "Lua version:",
+            "Lua 5.4.4 Copyright (C) 1994-2022 Lua.org, PUC-Rio",
+            "./lua ./poc",
+        ],
+    )
+
+    command = stage._select_recipe_run_command(recipe, "poc")
+
+    assert command == "./lua ./poc"
 
 
 def test_try_llm_plan_rejects_non_triggering_replan_without_substantive_changes(tmp_path, monkeypatch):
