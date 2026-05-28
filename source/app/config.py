@@ -35,6 +35,7 @@ class RuntimeConfig(BaseModel):
     knowledge_fetch_timeout_seconds: int = Field(default=8, description="Timeout for each remote fetch in the knowledge stage.")
     knowledge_enable_llm_curation: bool = Field(default=False, description="Whether the knowledge stage should invoke the curation LLM.")
     llm_timeout_seconds: int = Field(default=30, description="Timeout passed to LLM client requests.")
+    build_agent_timeout_seconds: int = Field(default=60, description="Timeout for build-agent LLM requests.")
 
 
 class AppConfig(BaseModel):
@@ -79,6 +80,7 @@ def load_app_config() -> AppConfig:
             knowledge_fetch_timeout_seconds=int(os.getenv("KNOWLEDGE_FETCH_TIMEOUT_SECONDS", "8")),
             knowledge_enable_llm_curation=os.getenv("KNOWLEDGE_ENABLE_LLM_CURATION", "0").strip().lower() in {"1", "true", "yes", "on"},
             llm_timeout_seconds=int(os.getenv("LLM_TIMEOUT_SECONDS", "30")),
+            build_agent_timeout_seconds=int(os.getenv("BUILD_AGENT_TIMEOUT_SECONDS", os.getenv("LLM_TIMEOUT_SECONDS", "60"))),
         ),
     )
 
@@ -93,7 +95,12 @@ def get_agent_model_config(agent_name: str) -> AgentModelConfig:
         raise ValueError(f"Unknown agent name: {agent_name}") from error
 
 
-def build_chat_model(agent_name: str, model_name: Optional[str] = None, temperature: float = 0):
+def build_chat_model(
+    agent_name: str,
+    model_name: Optional[str] = None,
+    temperature: float = 0,
+    timeout_seconds: Optional[int] = None,
+):
     """Create a LangChain chat model for a specific agent."""
 
     from langchain_openai import ChatOpenAI
@@ -108,5 +115,5 @@ def build_chat_model(agent_name: str, model_name: Optional[str] = None, temperat
         temperature=temperature,
         api_key=agent_config.api_key,
         base_url=agent_config.base_url,
-        timeout=runtime.llm_timeout_seconds,
+        timeout=timeout_seconds or runtime.llm_timeout_seconds,
     )

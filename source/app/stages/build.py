@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional, TypedDict
 
 import yaml
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
@@ -26,7 +26,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal envs
     FileSystemLoader = None
     StrictUndefined = None
 
-from app.config import build_chat_model
+from app.config import build_chat_model, load_app_config
 from app.schemas.build_artifact import BuildArtifact
 from app.schemas.knowledge import KnowledgeModel
 from app.tools.docker_tools import DockerBuildRequest, DockerCommandResult, DockerRunRequest, DockerTool
@@ -194,7 +194,11 @@ class BuildPlanner:
         previous_plan: Optional[BuildPlan] = None,
     ) -> Optional[BuildPlan]:
         try:
-            model = build_chat_model("build_agent", temperature=0)
+            model = build_chat_model(
+                "build_agent",
+                temperature=0,
+                timeout_seconds=load_app_config().runtime.build_agent_timeout_seconds,
+            )
         except Exception:
             return None
 
@@ -205,56 +209,81 @@ class BuildPlanner:
             previous_plan=previous_plan,
         )
         self.stage._persist_build_llm_trace(context.planner_attempt, "prompt.txt", prompt)
-        try:
-            response = model.invoke(
-                [
-                    SystemMessage(content="You return strict JSON only."),
-                    HumanMessage(content=prompt),
-                ]
-            )
-            raw_response = getattr(response, "content", response)
-            raw_text = raw_response if isinstance(raw_response, str) else str(raw_response)
-            self.stage._persist_build_llm_trace(context.planner_attempt, "response.txt", raw_text)
-            parsed = parse_llm_json_payload(raw_response)
-            if parsed is None:
+        messages = self.build_llm_messages(
+            knowledge=knowledge,
+            context=context,
+            project_name=project_name,
+            previous_plan=previous_plan,
+        )
+        retry_errors: list[str] = []
+        max_attempts = self.stage.MAX_LLM_NO_RESPONSE_RETRIES + 1
+        for invoke_attempt in range(1, max_attempts + 1):
+            try:
+                response = model.invoke(messages)
+                raw_response = getattr(response, "content", response)
+                raw_text = raw_response if isinstance(raw_response, str) else str(raw_response)
+                if self.stage._is_empty_llm_response(raw_text):
+                    retry_errors.append(f"Attempt {invoke_attempt}: empty response")
+                    if invoke_attempt < max_attempts:
+                        continue
+                    self.stage._persist_build_llm_trace(
+                        context.planner_attempt,
+                        "error.txt",
+                        f"LLM returned no content after {max_attempts} attempts.",
+                    )
+                    return None
+                self.stage._persist_build_llm_trace(context.planner_attempt, "response.txt", raw_text)
+                parsed = parse_llm_json_payload(raw_response)
+                if parsed is None:
+                    self.stage._persist_build_llm_trace(
+                        context.planner_attempt,
+                        "error.txt",
+                        "Failed to parse build-agent response as JSON.",
+                    )
+                    return None
+                self.stage._persist_build_llm_trace(
+                    context.planner_attempt,
+                    "parsed.json",
+                    json.dumps(parsed, ensure_ascii=False, indent=2),
+                )
+                plan = BuildPlan(**parsed)
+                if not plan.build_commands:
+                    self.stage._persist_build_llm_trace(
+                        context.planner_attempt,
+                        "error.txt",
+                        "Parsed build-agent response did not include build_commands.",
+                    )
+                    return None
+                if previous_plan is not None and not self.stage._is_valid_replan_candidate(
+                    previous_plan,
+                    plan,
+                    failure_kind=context.previous_failure_kind,
+                ):
+                    self.stage._persist_build_llm_trace(
+                        context.planner_attempt,
+                        "error.txt",
+                        "Rejected build-agent replan because it did not produce a valid execution-surface override.",
+                    )
+                    return None
+                return plan
+            except Exception as error:
+                error_text = str(error)
+                retry_errors.append(f"Attempt {invoke_attempt}: {error_text}")
+                if self.stage._should_retry_llm_request(error_text) and invoke_attempt < max_attempts:
+                    continue
                 self.stage._persist_build_llm_trace(
                     context.planner_attempt,
                     "error.txt",
-                    "Failed to parse build-agent response as JSON.",
+                    "\n".join(retry_errors),
                 )
                 return None
-            self.stage._persist_build_llm_trace(
-                context.planner_attempt,
-                "parsed.json",
-                json.dumps(parsed, ensure_ascii=False, indent=2),
-            )
-            plan = BuildPlan(**parsed)
-            if not plan.build_commands:
-                self.stage._persist_build_llm_trace(
-                    context.planner_attempt,
-                    "error.txt",
-                    "Parsed build-agent response did not include build_commands.",
-                )
-                return None
-            if previous_plan is not None and not self.stage._is_valid_replan_candidate(
-                previous_plan,
-                plan,
-                failure_kind=context.previous_failure_kind,
-            ):
-                self.stage._persist_build_llm_trace(
-                    context.planner_attempt,
-                    "error.txt",
-                    "Rejected build-agent replan because it did not produce a valid execution-surface override.",
-                )
-                return None
-            return plan
-        except Exception as error:
-            self.stage._persist_build_llm_trace(
-                context.planner_attempt,
-                "error.txt",
-                f"{type(error).__name__}: {error}",
-            )
-            return None
+
+        self.stage._persist_build_llm_trace(
+            context.planner_attempt,
+            "error.txt",
+            "\n".join(retry_errors) or "LLM request failed without a response.",
+        )
+        return None
 
     def build_llm_prompt(
         self,
@@ -269,6 +298,47 @@ class BuildPlanner:
             project_name=project_name,
             previous_plan=previous_plan,
         )
+
+    def build_llm_messages(
+        self,
+        knowledge: KnowledgeModel,
+        context: BuildContext,
+        project_name: str,
+        previous_plan: Optional[BuildPlan],
+    ) -> list[SystemMessage | HumanMessage | AIMessage]:
+        system_message = SystemMessage(content="You return strict JSON only.")
+        initial_prompt = self.stage._build_llm_prompt(
+            knowledge=knowledge,
+            context=context.model_copy(
+                update={
+                    "previous_failure_kind": "",
+                    "previous_build_failure": "",
+                    "previous_dockerfile_content": "",
+                    "previous_build_script_content": "",
+                }
+            ),
+            project_name=project_name,
+            previous_plan=None,
+        )
+        if previous_plan is None:
+            return [system_message, HumanMessage(content=initial_prompt)]
+
+        retry_prompt = self.stage._build_llm_retry_prompt(
+            context=context,
+            previous_plan=previous_plan,
+        )
+        return [
+            system_message,
+            HumanMessage(content=initial_prompt),
+            AIMessage(
+                content=yaml.safe_dump(
+                    previous_plan.model_dump(mode="json"),
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+            ),
+            HumanMessage(content=retry_prompt),
+        ]
 
     def heuristic_plan(self, knowledge: KnowledgeModel, context: BuildContext, project_name: str) -> BuildPlan:
         fallback_spec = self.stage._build_fallback_spec(
@@ -313,6 +383,7 @@ class BuildStage:
     )
     README_PATTERNS = ("README", "README.md", "README.txt", "INSTALL", "INSTALL.md")
     MAX_REPLAN_ATTEMPTS = 3
+    MAX_LLM_NO_RESPONSE_RETRIES = 2
     REQUIRED_DOCKER_PACKAGES = (
         "build-essential",
         "ca-certificates",
@@ -712,6 +783,13 @@ class BuildStage:
         self.file_tool.ensure_dir(str(attempt_dir))
         self.file_tool.write_text(str(attempt_dir / filename), (content or "").rstrip() + "\n")
 
+    def _should_retry_llm_request(self, error_text: str) -> bool:
+        normalized = (error_text or "").strip().lower()
+        return "timed out" in normalized or "timeout" in normalized
+
+    def _is_empty_llm_response(self, raw_response: str) -> bool:
+        return not (raw_response or "").strip()
+
     def _write_yaml_file(self, path: Path, payload: Any) -> None:
         """Persist YAML using one consistent formatting policy."""
 
@@ -746,9 +824,9 @@ class BuildStage:
                 return False
             return True
         if normalized_failure_kind == "container_run":
-            if not (candidate_plan.build_script_override or candidate_plan.dockerfile_override):
-                return False
-            return True
+            if candidate_plan.build_script_override or candidate_plan.dockerfile_override:
+                return True
+            return self._changes_build_execution_surface(previous_plan, candidate_plan)
         if candidate_plan.dockerfile_override or candidate_plan.build_script_override:
             return True
         return self._changes_build_execution_surface(previous_plan, candidate_plan)
@@ -1042,17 +1120,41 @@ class BuildStage:
                 },
                 ensure_ascii=True,
             ),
-            f"CVE: {knowledge.cve_id}",
-            f"Repository: {knowledge.repo_url or ''}",
-            f"Knowledge summary: {knowledge.summary}",
-            f"Knowledge vulnerable_ref: {knowledge.vulnerable_ref or ''}",
-            f"Knowledge fixed_ref: {knowledge.fixed_ref or ''}",
-            f"Knowledge build_hints: {json.dumps(knowledge.build_hints, ensure_ascii=False)}",
-            f"Knowledge reproduction_hints: {json.dumps(knowledge.reproduction_hints, ensure_ascii=False)}",
-            f"Patch affected files: {json.dumps(context.patch_affected_files, ensure_ascii=False)}",
-            "Patch excerpt:",
-            context.patch_diff_excerpt or "<empty>",
         ]
+
+        if previous_plan is not None:
+            sections.extend(
+                [
+                    "",
+                    "Previous attempt debugging evidence:",
+                    f"Previous failure kind: {context.previous_failure_kind or '<empty>'}",
+                    "Previous failure logs:",
+                    context.previous_build_failure or "<empty>",
+                    "Previous plan:",
+                    yaml.safe_dump(previous_plan.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
+                    "Previously rendered Dockerfile:",
+                    context.previous_dockerfile_content or "<empty>",
+                    "Previously rendered build.sh:",
+                    context.previous_build_script_content or "<empty>",
+                    "Rewrite the plan using these concrete artifacts. If a script or Dockerfile edit is needed, use dockerfile_override and/or build_script_override instead of describing the change abstractly.",
+                ]
+            )
+
+        sections.extend(
+            [
+                "",
+                f"CVE: {knowledge.cve_id}",
+                f"Repository: {knowledge.repo_url or ''}",
+                f"Knowledge summary: {knowledge.summary}",
+                f"Knowledge vulnerable_ref: {knowledge.vulnerable_ref or ''}",
+                f"Knowledge fixed_ref: {knowledge.fixed_ref or ''}",
+                f"Knowledge build_hints: {json.dumps(knowledge.build_hints, ensure_ascii=False)}",
+                f"Knowledge reproduction_hints: {json.dumps(knowledge.reproduction_hints, ensure_ascii=False)}",
+                f"Patch affected files: {json.dumps(context.patch_affected_files, ensure_ascii=False)}",
+                "Patch excerpt:",
+                context.patch_diff_excerpt or "<empty>",
+            ]
+        )
 
         for snapshot in context.snapshots:
             sections.extend(
@@ -1068,24 +1170,63 @@ class BuildStage:
                     "\n\n---\n\n".join(snapshot.file_excerpts[:6]) or "<empty>",
                 ]
             )
-
-        if previous_plan is not None:
-            sections.extend(
-                [
-                    "",
-                    f"Previous failure kind: {context.previous_failure_kind or '<empty>'}",
-                    "Previous plan:",
-                    yaml.safe_dump(previous_plan.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
-                    "Previous failure logs:",
-                    context.previous_build_failure or "<empty>",
-                    "Previously rendered Dockerfile:",
-                    context.previous_dockerfile_content or "<empty>",
-                    "Previously rendered build.sh:",
-                    context.previous_build_script_content or "<empty>",
-                    "Rewrite the plan using these concrete artifacts. If a script or Dockerfile edit is needed, use dockerfile_override and/or build_script_override instead of describing the change abstractly.",
-                ]
-            )
         return "\n".join(sections)
+
+    def _build_llm_retry_prompt(
+        self,
+        context: BuildContext,
+        previous_plan: BuildPlan,
+    ) -> str:
+        failure_summary = self._summarize_build_failure(context.previous_build_failure)
+        return "\n".join(
+            [
+                "Revise your previous build plan using the new failure evidence below.",
+                "Keep the same JSON schema and return strict JSON only.",
+                "Do not repeat the same failing plan.",
+                "",
+                f"Previous failure kind: {context.previous_failure_kind or '<empty>'}",
+                "Failure summary:",
+                failure_summary,
+                "Previous failure logs:",
+                self._truncate_tail(context.previous_build_failure or "<empty>", 2400),
+                "Previously rendered Dockerfile:",
+                self._truncate_text(context.previous_dockerfile_content or "<empty>", 2400),
+                "Previously rendered build.sh:",
+                self._truncate_text(context.previous_build_script_content or "<empty>", 2600),
+                "Previous plan for reference:",
+                yaml.safe_dump(previous_plan.model_dump(mode='json'), sort_keys=False, allow_unicode=True),
+            ]
+        )
+
+    def _summarize_build_failure(self, build_logs: str) -> str:
+        value = (build_logs or "").strip()
+        if not value:
+            return "<empty>"
+        lines = [line.rstrip() for line in value.splitlines() if line.strip()]
+        error_like = [
+            line for line in lines
+            if any(token in line.lower() for token in ("error", "fatal", "no rule", "failed", "not found", "undefined reference"))
+        ]
+        summary_lines = error_like[-5:] if error_like else lines[-5:]
+        return "\n".join(summary_lines)
+
+    def _truncate_text(self, text: str, limit: int) -> str:
+        value = text or ""
+        if len(value) <= limit:
+            return value
+        if limit <= 32:
+            return value[:limit]
+        omitted = len(value) - limit
+        return f"{value[: limit - 24]}\n...[truncated {omitted} chars]"
+
+    def _truncate_tail(self, text: str, limit: int) -> str:
+        value = text or ""
+        if len(value) <= limit:
+            return value
+        if limit <= 32:
+            return value[-limit:]
+        omitted = len(value) - limit
+        return f"...[truncated {omitted} chars]\n{value[-(limit - 24):]}"
 
     def _heuristic_build_plan(self, knowledge: KnowledgeModel, context: BuildContext, project_name: str) -> BuildPlan:
         fallback_spec = self._build_fallback_spec(

@@ -2,6 +2,9 @@
 
 import json
 
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+from app.config import AppConfig, AgentModelConfig, RuntimeConfig
 from app.schemas.build_artifact import BuildArtifact
 from app.schemas.knowledge import KnowledgeModel
 from app.stages import build as build_module
@@ -195,6 +198,28 @@ def test_classify_failure_kind_distinguishes_docker_and_container_failures():
     assert stage._classify_failure_kind(container_run_log) == "container_run"
 
 
+def test_valid_replan_candidate_accepts_build_command_changes_for_container_run():
+    stage = build_module.BuildStage()
+    previous_plan = build_module.BuildPlan(
+        chosen_vulnerable_ref="deadbeef",
+        build_system="make",
+        install_packages=["gcc", "make"],
+        build_commands=["make -j$(nproc)"],
+    )
+    candidate_plan = build_module.BuildPlan(
+        chosen_vulnerable_ref="deadbeef",
+        build_system="make",
+        install_packages=["gcc", "make"],
+        build_commands=["make linux"],
+    )
+
+    assert stage._is_valid_replan_candidate(
+        previous_plan,
+        candidate_plan,
+        failure_kind="container_run",
+    )
+
+
 def test_normalize_build_plan_preserves_required_docker_packages(tmp_path):
     stage = build_module.BuildStage()
     repo = tmp_path / "repo"
@@ -307,9 +332,195 @@ def test_build_replan_prompt_includes_rendered_artifacts():
     assert "compiler not found: clang" in prompt
     assert "dockerfile_override" in prompt
     assert "build_script_override" in prompt
+    assert prompt.index("Previous failure logs:") < prompt.index("Patch excerpt:")
 
 
-def test_replan_candidate_requires_execution_surface_change_or_override():
+def test_build_replan_messages_reuse_single_conversation_history():
+    stage = build_module.BuildStage()
+    planner = build_module.BuildPlanner(stage)
+    knowledge = make_knowledge()
+    context = build_module.BuildContext(
+        cve_id=knowledge.cve_id,
+        repo_url=knowledge.repo_url or "",
+        previous_failure_kind="container_run",
+        previous_build_failure="compiler not found: clang",
+        previous_dockerfile_content="FROM ubuntu:20.04\nRUN apt-get install -y git make\n",
+        previous_build_script_content="#!/bin/bash\nexport CC=clang\nmake -j$(nproc)\n",
+    )
+    previous_plan = build_module.BuildPlan(
+        chosen_vulnerable_ref="deadbeef",
+        build_system="make",
+        install_packages=["build-essential", "git", "make"],
+        build_commands=["make -j$(nproc)"],
+    )
+
+    messages = planner.build_llm_messages(
+        knowledge=knowledge,
+        context=context,
+        project_name="demo",
+        previous_plan=previous_plan,
+    )
+
+    assert len(messages) == 4
+    assert isinstance(messages[0], SystemMessage)
+    assert isinstance(messages[1], HumanMessage)
+    assert isinstance(messages[2], AIMessage)
+    assert isinstance(messages[3], HumanMessage)
+    assert "Patch excerpt:" in messages[1].content
+    assert "compiler not found: clang" not in messages[1].content
+    assert "chosen_vulnerable_ref: deadbeef" in messages[2].content
+    assert "Previous failure logs:" in messages[3].content
+    assert "compiler not found: clang" in messages[3].content
+    assert "Patch excerpt:" not in messages[3].content
+
+
+def test_build_retry_prompt_truncates_large_failure_artifacts():
+    stage = build_module.BuildStage()
+    previous_plan = build_module.BuildPlan(
+        chosen_vulnerable_ref="deadbeef",
+        build_system="make",
+        install_packages=["build-essential", "git", "make"],
+        build_commands=["make -j$(nproc)"],
+    )
+    context = build_module.BuildContext(
+        cve_id="CVE-2022-0000",
+        previous_failure_kind="container_run",
+        previous_build_failure=("line\n" * 2000) + "fatal error: missing header\n",
+        previous_dockerfile_content="FROM ubuntu:20.04\n" + ("RUN echo hi\n" * 500),
+        previous_build_script_content="#!/bin/bash\n" + ("echo hi\n" * 600),
+    )
+
+    prompt = stage._build_llm_retry_prompt(context, previous_plan)
+
+    assert "Failure summary:" in prompt
+    assert "fatal error: missing header" in prompt
+    assert "[truncated " in prompt
+    assert len(prompt) < 9000
+
+
+def test_build_try_llm_plan_retries_timeout_twice_before_success(tmp_path, monkeypatch):
+    class FakeResponse:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("Request timed out.")
+            return FakeResponse(
+                '{"chosen_vulnerable_ref":"deadbeef","chosen_fixed_ref":null,"build_system":"make",'
+                '"install_packages":["build-essential","git","make"],"configure_commands":[],"clean_commands":["make clean || true"],'
+                '"build_commands":["make -j$(nproc)"],"expected_binary_path":"demo","dockerfile_override":null,'
+                '"build_script_override":null,"source_of_truth":"llm","confidence":"high","rationale":"retry success"}'
+            )
+
+    fake_model = FakeModel()
+    monkeypatch.setattr(build_module, "build_chat_model", lambda *args, **kwargs: fake_model)
+
+    stage = build_module.BuildStage()
+    planner = build_module.BuildPlanner(stage)
+    paths = build_module.BuildStagePaths(str(tmp_path / "ws"))
+    stage._prepare_workspace(paths)
+    stage._active_build_dir = str(paths.build_dir)
+
+    plan = planner.try_llm_plan(
+        knowledge=make_knowledge(),
+        context=build_module.BuildContext(cve_id="CVE-2022-28805", planner_attempt=4),
+        project_name="demo",
+    )
+
+    assert plan is not None
+    assert fake_model.calls == 3
+    assert (paths.llm_dir / "attempt-4" / "response.txt").exists()
+
+
+def test_build_try_llm_plan_uses_build_agent_timeout_override(tmp_path, monkeypatch):
+    class FakeResponse:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeModel:
+        def invoke(self, messages):
+            return FakeResponse(
+                '{"chosen_vulnerable_ref":"deadbeef","chosen_fixed_ref":null,"build_system":"make",'
+                '"install_packages":["build-essential","git","make"],"configure_commands":[],"clean_commands":["make clean || true"],'
+                '"build_commands":["make -j$(nproc)"],"expected_binary_path":"demo","dockerfile_override":null,'
+                '"build_script_override":null,"source_of_truth":"llm","confidence":"high","rationale":"ok"}'
+            )
+
+    captured = {}
+
+    def fake_build_chat_model(agent_name, model_name=None, temperature=0, timeout_seconds=None):
+        captured["agent_name"] = agent_name
+        captured["timeout_seconds"] = timeout_seconds
+        return FakeModel()
+
+    monkeypatch.setattr(build_module, "build_chat_model", fake_build_chat_model)
+    monkeypatch.setattr(
+        build_module,
+        "load_app_config",
+        lambda: AppConfig(
+            build_agent=AgentModelConfig(model_name="demo", api_key="key"),
+            runtime=RuntimeConfig(build_agent_timeout_seconds=77),
+        ),
+    )
+
+    stage = build_module.BuildStage()
+    planner = build_module.BuildPlanner(stage)
+    paths = build_module.BuildStagePaths(str(tmp_path / "ws"))
+    stage._prepare_workspace(paths)
+    stage._active_build_dir = str(paths.build_dir)
+
+    plan = planner.try_llm_plan(
+        knowledge=make_knowledge(),
+        context=build_module.BuildContext(cve_id="CVE-2022-28805", planner_attempt=6),
+        project_name="demo",
+    )
+
+    assert plan is not None
+    assert captured["agent_name"] == "build_agent"
+    assert captured["timeout_seconds"] == 77
+
+
+def test_build_try_llm_plan_records_final_error_after_three_empty_responses(tmp_path, monkeypatch):
+    class FakeResponse:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            return FakeResponse("   ")
+
+    fake_model = FakeModel()
+    monkeypatch.setattr(build_module, "build_chat_model", lambda *args, **kwargs: fake_model)
+
+    stage = build_module.BuildStage()
+    planner = build_module.BuildPlanner(stage)
+    paths = build_module.BuildStagePaths(str(tmp_path / "ws"))
+    stage._prepare_workspace(paths)
+    stage._active_build_dir = str(paths.build_dir)
+
+    plan = planner.try_llm_plan(
+        knowledge=make_knowledge(),
+        context=build_module.BuildContext(cve_id="CVE-2022-28805", planner_attempt=5),
+        project_name="demo",
+    )
+
+    assert plan is None
+    assert fake_model.calls == 3
+    error_text = (paths.llm_dir / "attempt-5" / "error.txt").read_text(encoding="utf-8")
+    assert "no content after 3 attempts" in error_text
+
+
+def test_replan_candidate_requires_meaningful_execution_surface_change():
     stage = build_module.BuildStage()
     previous_plan = build_module.BuildPlan(
         chosen_vulnerable_ref="deadbeef",
@@ -351,7 +562,7 @@ def test_replan_candidate_requires_execution_surface_change_or_override():
     assert stage._is_valid_replan_candidate(previous_plan, override_only) is True
     assert stage._is_valid_replan_candidate(previous_plan, changed_packages, failure_kind="docker_build") is False
     assert stage._is_valid_replan_candidate(previous_plan, override_only, failure_kind="docker_build") is True
-    assert stage._is_valid_replan_candidate(previous_plan, changed_packages, failure_kind="container_run") is False
+    assert stage._is_valid_replan_candidate(previous_plan, changed_packages, failure_kind="container_run") is True
     assert stage._is_valid_replan_candidate(previous_plan, script_override_only, failure_kind="container_run") is True
 
 
