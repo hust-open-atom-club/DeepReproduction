@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from app.config import build_chat_model, load_app_config
 from app.schemas.fetched_page import FetchedPage
-from app.schemas.knowledge import KnowledgeModel
+from app.schemas.knowledge import KnowledgeModel, ReproductionRecipe
 from app.schemas.task import TaskModel, TaskReference
 from app.tools.archive_tools import ArchiveTool
 from app.tools.content_cleaner import ContentCleaner
@@ -57,6 +57,12 @@ class ExtractedPoc(BaseModel):
     filename: str = Field(default="poc.txt", description="Suggested PoC filename.")
     content: str = Field(default="", description="PoC or reproduction script content.")
     rationale: str = Field(default="", description="Short explanation for the extraction decision.")
+
+
+class ExtractedRecipeBundle(BaseModel):
+    """Structured reproduction recipes extracted from evidence."""
+
+    recipes: List[ReproductionRecipe] = Field(default_factory=list, description="Recovered reproduction recipes.")
 
 
 @dataclass(frozen=True)
@@ -491,6 +497,7 @@ class KnowledgeStage:
             build_commands=heuristic_build_commands,
             patch_summaries=patch_summaries,
         )
+        heuristic_reproduction_recipes = extract_reproduction_recipes(fetched_pages)
         heuristic_reproduction_hints = build_reproduction_hints(task, fetched_pages, patch_summaries)
         heuristic_expected_stack_keywords = extract_stack_keywords(patch_summaries)
         selected_reference_urls = limit_output_urls(
@@ -511,6 +518,7 @@ class KnowledgeStage:
             llm_result.install_commands = llm_result.install_commands or heuristic_install_commands
             llm_result.build_commands = llm_result.build_commands or heuristic_build_commands
             llm_result.build_hints = llm_result.build_hints or heuristic_build_hints
+            llm_result.reproduction_recipes = llm_result.reproduction_recipes or heuristic_reproduction_recipes
             llm_result.reproduction_hints = llm_result.reproduction_hints or heuristic_reproduction_hints
             llm_result.expected_stack_keywords = llm_result.expected_stack_keywords or heuristic_expected_stack_keywords
             llm_result.expected_error_patterns = llm_result.expected_error_patterns or default_error_patterns(
@@ -532,6 +540,7 @@ class KnowledgeStage:
             build_commands=heuristic_build_commands,
             build_hints=heuristic_build_hints,
             reproduction_hints=heuristic_reproduction_hints,
+            reproduction_recipes=heuristic_reproduction_recipes,
             expected_error_patterns=default_error_patterns(heuristic_vuln_type),
             expected_stack_keywords=heuristic_expected_stack_keywords,
             references=selected_reference_urls,
@@ -568,6 +577,10 @@ class KnowledgeStage:
                 )
             )
 
+        reproduction_blocks = build_reproduction_evidence_blocks(fetched_pages)
+        if reproduction_blocks:
+            evidence_blocks.append("Reproduction evidence:\n" + "\n\n---\n\n".join(reproduction_blocks[:4]))
+
         if not evidence_blocks:
             self.last_llm_status = "skipped_no_evidence"
             self.last_llm_error = None
@@ -595,12 +608,29 @@ class KnowledgeStage:
                         "build_commands": ["string"],
                         "build_hints": ["string"],
                         "reproduction_hints": ["string"],
+                        "reproduction_recipes": [
+                            {
+                                "source_url": "string",
+                                "source_title": "string",
+                                "recipe_type": "string",
+                                "steps": ["string"],
+                                "repo_setup_commands": ["string"],
+                                "build_commands": ["string"],
+                                "artifact_generation_commands": ["string"],
+                                "run_commands": ["string"],
+                                "expected_behavior": ["string"],
+                                "source_excerpt": "string",
+                                "confidence": "string",
+                            }
+                        ],
                         "expected_error_patterns": ["string"],
                         "expected_stack_keywords": ["string"],
                         "references": ["string"],
                     },
                     ensure_ascii=True,
                 ),
+                "If the evidence shows a reproducer or numbered shell steps, preserve the sequence in reproduction_recipes.steps.",
+                "Keep source_excerpt grounded in the original evidence instead of paraphrasing away the command details.",
                 f"CVE: {task.cve_id}",
                 f"Repository: {task.repo_url or ''}",
                 f"Vulnerable ref: {task.vulnerable_ref or ''}",
@@ -1695,9 +1725,183 @@ def build_reproduction_hints(task: TaskModel, fetched_pages: List[FetchedPage], 
         hints.append(f"Compare with the fixed revision: {task.fixed_ref}.")
     if patch_summaries:
         hints.append("Review the patch to identify the modified files and triggering path.")
+    recipes = extract_reproduction_recipes(fetched_pages)
+    if recipes:
+        hints.append("Recovered explicit reproduction steps from the collected evidence.")
     if any(page.cleaned_text for page in fetched_pages):
         hints.append("Use the cleaned advisory or discussion pages to recover trigger conditions and expected error signatures.")
     return dedupe_preserve_order(hints)
+
+
+_REPRO_SECTION_KEYWORDS = (
+    "how to reproduce",
+    "reproduce",
+    "reproducer",
+    "proof of concept",
+    "poc",
+    "steps",
+    "trigger",
+    "base64",
+)
+
+_COMMAND_START_RE = re.compile(
+    r"^(?:\$|#|>)?\s*(?:"
+    r"git clone\b|git checkout\b|cd\b|make\b|cmake\b|ninja\b|cargo\b|go build\b|python\b|python3\b|"
+    r"perl\b|ruby\b|node\b|npm\b|yarn\b|./|echo\b|base64\b|cat\b|cp\b|mv\b|ln\b|lua\b|docker\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_RUN_COMMAND_HINTS = ("./", "lua ", "python ", "python3 ", "node ", "perl ", "ruby ")
+_BUILD_COMMAND_HINTS = ("make", "cmake", "ninja", "cargo", "go build", "meson", "configure")
+
+
+def build_reproduction_evidence_blocks(fetched_pages: List[FetchedPage], limit: int = 6) -> List[str]:
+    blocks: list[str] = []
+
+    for page in fetched_pages:
+        if not page.cleaned_text:
+            continue
+        excerpt = extract_reproduction_excerpt(page.cleaned_text)
+        if not excerpt:
+            continue
+        blocks.append(
+            "\n".join(
+                [
+                    f"URL: {page.url}",
+                    f"Title: {page.title}",
+                    "Excerpt:",
+                    excerpt,
+                ]
+            )
+        )
+        if len(blocks) >= limit:
+            break
+
+    return blocks
+
+
+def extract_reproduction_recipes(fetched_pages: List[FetchedPage], limit: int = 4) -> List[ReproductionRecipe]:
+    recipes: list[ReproductionRecipe] = []
+
+    for page in fetched_pages:
+        if not page.cleaned_text:
+            continue
+        excerpt = extract_reproduction_excerpt(page.cleaned_text)
+        if not excerpt:
+            continue
+        steps = extract_recipe_steps(excerpt)
+        if len(steps) < 2:
+            continue
+        recipes.append(
+            ReproductionRecipe(
+                source_url=page.url,
+                source_title=page.title,
+                recipe_type="shell_sequence",
+                steps=steps,
+                repo_setup_commands=classify_recipe_steps(steps, "repo_setup"),
+                build_commands=classify_recipe_steps(steps, "build"),
+                artifact_generation_commands=classify_recipe_steps(steps, "artifact_generation"),
+                run_commands=classify_recipe_steps(steps, "run"),
+                source_excerpt=excerpt,
+                confidence="medium",
+            )
+        )
+        if len(recipes) >= limit:
+            break
+
+    return recipes
+
+
+def extract_reproduction_excerpt(cleaned_text: str, max_chars: int = 2400) -> str:
+    paragraphs = [segment.strip() for segment in re.split(r"\n\s*\n", cleaned_text) if segment.strip()]
+    for index, paragraph in enumerate(paragraphs):
+        lowered = paragraph.lower()
+        if any(keyword in lowered for keyword in _REPRO_SECTION_KEYWORDS):
+            candidate_parts = [paragraph]
+            for neighbor in paragraphs[index + 1 : index + 4]:
+                if looks_like_command_block(neighbor) or contains_reproduction_signal(neighbor):
+                    candidate_parts.append(neighbor)
+                else:
+                    break
+            return truncate_preserving_lines("\n\n".join(candidate_parts), max_chars)
+
+    command_blocks = [paragraph for paragraph in paragraphs if looks_like_command_block(paragraph)]
+    if command_blocks:
+        return truncate_preserving_lines(command_blocks[0], max_chars)
+
+    return ""
+
+
+def contains_reproduction_signal(text: str) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in _REPRO_SECTION_KEYWORDS)
+
+
+def looks_like_command_block(text: str) -> bool:
+    command_lines = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _COMMAND_START_RE.match(stripped):
+            command_lines += 1
+        elif re.match(r"^\d+\.\s+", stripped):
+            payload = normalize_command_candidate(stripped)
+            if _COMMAND_START_RE.match(payload):
+                command_lines += 1
+    return command_lines >= 2
+
+
+def extract_recipe_steps(excerpt: str) -> List[str]:
+    steps: list[str] = []
+    for line in excerpt.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        normalized = normalize_command_candidate(stripped)
+        if _COMMAND_START_RE.match(normalized):
+            steps.append(normalized)
+            continue
+        if re.match(r"^\d+\.\s+", stripped):
+            numbered = normalize_command_candidate(stripped)
+            if _COMMAND_START_RE.match(numbered):
+                steps.append(numbered)
+    return dedupe_preserve_order(steps)
+
+
+def classify_recipe_steps(steps: List[str], category: str) -> List[str]:
+    selected: list[str] = []
+    for step in steps:
+        lowered = step.lower()
+        if category == "repo_setup" and ("git clone" in lowered or lowered.startswith("git checkout") or lowered.startswith("cd ")):
+            selected.append(step)
+        elif category == "build" and any(token in lowered for token in _BUILD_COMMAND_HINTS):
+            selected.append(step)
+        elif category == "artifact_generation" and any(token in lowered for token in ("base64", "cat ", "echo ", ">", "printf ")):
+            selected.append(step)
+        elif category == "run" and any(token in lowered for token in _RUN_COMMAND_HINTS):
+            selected.append(step)
+    return dedupe_preserve_order(selected)
+
+
+def truncate_preserving_lines(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    lines: list[str] = []
+    total = 0
+    for line in text.splitlines():
+        extra = len(line) + (1 if lines else 0)
+        if lines and total + extra > max_chars:
+            break
+        if not lines and len(line) > max_chars:
+            return line[: max_chars - 3].rstrip() + "..."
+        lines.append(line)
+        total += extra
+    truncated = "\n".join(lines).rstrip()
+    if truncated == text:
+        return truncated
+    return truncated + "\n..."
 
 
 def parse_llm_json_payload(content) -> Optional[dict]:

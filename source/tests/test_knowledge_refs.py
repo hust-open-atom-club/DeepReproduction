@@ -18,6 +18,7 @@ from app.stages.knowledge import (
     KnowledgeStage,
     ReferenceRecord,
     derive_reference_variants,
+    extract_reproduction_recipes,
     extract_summary_candidate,
     heuristic_summary_from_pages,
     infer_git_refs,
@@ -246,6 +247,7 @@ class InferGitRefsTests(unittest.TestCase):
         self.assertEqual(knowledge.summary, "LLM summary")
         self.assertEqual(knowledge.affected_files, ["src/validator.go"])
         self.assertTrue(knowledge.reproduction_hints)
+        self.assertEqual(knowledge.reproduction_recipes, [])
         self.assertEqual(knowledge.expected_stack_keywords, ["func validatePreviousRecord() error"])
         self.assertEqual(knowledge.references, ["https://example.com/advisory"])
 
@@ -348,6 +350,99 @@ class InferGitRefsTests(unittest.TestCase):
         self.assertIn("go build ./cmd/server", knowledge.build_commands)
         self.assertIn("make release", knowledge.build_commands)
         self.assertTrue(knowledge.build_hints)
+
+    def test_reproduction_recipe_preserves_full_shell_sequence(self) -> None:
+        fetched_pages = [
+            FetchedPage(
+                url="https://osv.dev/reference",
+                title="OSV reference",
+                html="",
+                cleaned_text=(
+                    "How to reproduce:\n"
+                    "1. git clone https://github.com/lua/lua -q\n"
+                    "2. cd lua/ && make -j$(nproc)\n"
+                    '3. echo -n "bG9jYWwgdSxfLE4sXyx3LE4sZCxXCmZ1bmN0aW9uIGMoRSxMLGwsUyxULHUsTSxULGwsaCxoLHUsdSxsLGgsaCx1LHUsTSx1LHUsdSxsLGgsaCxsKXM9cyBsb2NhbAllLGUsXyxfLE4sZSxzMCxOLFYsXyBmdW5jdGlvbiBjKGIsbClpLHM9TiBsb2NhbCBjIGxvY2FsIF9FTlY8Y29uc3Q+ID0wIG89MCBmdW5jdGlvbiBlKCllbmQ7ZSIicmV0dXJuIGVuZDtlMCxhLHcscyxzLHM9IiJyZXR1cm4jYyIiZW5kO2VlPSIicmV0dXJuDGMiIg==" | base64 -d > poc\n'
+                    "4. ./lua ./poc\n"
+                ),
+                status_code=200,
+                content_type="text/html",
+                local_path=None,
+                links=[],
+            )
+        ]
+
+        recipes = extract_reproduction_recipes(fetched_pages)
+
+        self.assertEqual(len(recipes), 1)
+        self.assertEqual(
+            recipes[0].steps,
+            [
+                "git clone https://github.com/lua/lua -q",
+                "cd lua/ && make -j$(nproc)",
+                'echo -n "bG9jYWwgdSxfLE4sXyx3LE4sZCxXCmZ1bmN0aW9uIGMoRSxMLGwsUyxULHUsTSxULGwsaCxoLHUsdSxsLGgsaCx1LHUsTSx1LHUsdSxsLGgsaCxsKXM9cyBsb2NhbAllLGUsXyxfLE4sZSxzMCxOLFYsXyBmdW5jdGlvbiBjKGIsbClpLHM9TiBsb2NhbCBjIGxvY2FsIF9FTlY8Y29uc3Q+ID0wIG89MCBmdW5jdGlvbiBlKCllbmQ7ZSIicmV0dXJuIGVuZDtlMCxhLHcscyxzLHM9IiJyZXR1cm4jYyIiZW5kO2VlPSIicmV0dXJuDGMiIg==" | base64 -d > poc',
+                "./lua ./poc",
+            ],
+        )
+        self.assertIn("git clone https://github.com/lua/lua -q", recipes[0].repo_setup_commands)
+        self.assertIn("cd lua/ && make -j$(nproc)", recipes[0].build_commands)
+        self.assertIn("./lua ./poc", recipes[0].run_commands)
+        self.assertIn('base64 -d > poc', recipes[0].source_excerpt)
+
+    def test_synthesize_knowledge_backfills_reproduction_recipes_from_heuristics(self) -> None:
+        task = TaskModel(
+            task_id="CVE-LUA",
+            cve_id="CVE-LUA",
+            repo_url="https://github.com/lua/lua.git",
+            references=[],
+            reference_details=[],
+        )
+        source_registry = KnowledgeSourcesModel(
+            cve_id="CVE-LUA",
+            selected_references=[ReferenceRecord(url="https://osv.dev/reference")],
+        )
+        fetched_pages = [
+            FetchedPage(
+                url="https://osv.dev/reference",
+                title="OSV reference",
+                html="",
+                cleaned_text=(
+                    "How to reproduce:\n"
+                    "1. git clone https://github.com/lua/lua -q\n"
+                    "2. cd lua/ && make -j$(nproc)\n"
+                    '3. echo -n "AAAA" | base64 -d > poc\n'
+                    "4. ./lua ./poc\n"
+                ),
+                status_code=200,
+                content_type="text/html",
+                local_path=None,
+                links=[],
+            )
+        ]
+
+        stage = KnowledgeStage()
+        with patch.object(
+            stage,
+            "_try_llm_synthesis",
+            return_value=KnowledgeModel(
+                cve_id="CVE-LUA",
+                summary="Lua issue",
+                vulnerability_type="memory-corruption",
+                repo_url="",
+                vulnerable_ref="",
+                fixed_ref="",
+                affected_files=[],
+                reproduction_hints=[],
+                reproduction_recipes=[],
+                expected_error_patterns=[],
+                expected_stack_keywords=[],
+                references=[],
+            ),
+        ):
+            knowledge = stage.synthesize_knowledge(task, source_registry, fetched_pages, [])
+
+        self.assertEqual(len(knowledge.reproduction_recipes), 1)
+        self.assertEqual(knowledge.reproduction_recipes[0].steps[-1], "./lua ./poc")
+        self.assertTrue(knowledge.reproduction_hints)
 
     def test_sanitize_filename_stays_short_for_long_urls(self) -> None:
         value = "https://invent.kde.org/frameworks/kimageformats/-/commit/297ed9a2fe339bfe36916b9fce628c3242e5be0f?action=show&controller=projects%2Fcommit&id=297ed9a2fe339bfe36916b9fce628c3242e5be0f"
