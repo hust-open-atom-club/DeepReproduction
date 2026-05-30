@@ -36,6 +36,7 @@ class RuntimeConfig(BaseModel):
     knowledge_enable_llm_curation: bool = Field(default=False, description="Whether the knowledge stage should invoke the curation LLM.")
     llm_timeout_seconds: int = Field(default=30, description="Timeout passed to LLM client requests.")
     build_agent_timeout_seconds: int = Field(default=60, description="Timeout for build-agent LLM requests.")
+    poc_agent_timeout_seconds: int = Field(default=90, description="Timeout for poc-agent LLM requests.")
 
 
 class AppConfig(BaseModel):
@@ -81,6 +82,7 @@ def load_app_config() -> AppConfig:
             knowledge_enable_llm_curation=os.getenv("KNOWLEDGE_ENABLE_LLM_CURATION", "0").strip().lower() in {"1", "true", "yes", "on"},
             llm_timeout_seconds=int(os.getenv("LLM_TIMEOUT_SECONDS", "30")),
             build_agent_timeout_seconds=int(os.getenv("BUILD_AGENT_TIMEOUT_SECONDS", os.getenv("LLM_TIMEOUT_SECONDS", "60"))),
+            poc_agent_timeout_seconds=int(os.getenv("POC_AGENT_TIMEOUT_SECONDS", os.getenv("LLM_TIMEOUT_SECONDS", "90"))),
         ),
     )
 

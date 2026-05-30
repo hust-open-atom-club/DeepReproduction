@@ -1,6 +1,7 @@
 """文件说明：PoC 阶段测试。用于校验上下文收集、执行解析和节点重试。"""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.schemas.build_artifact import BuildArtifact
 from app.schemas.knowledge import KnowledgeModel, ReproductionRecipe
@@ -90,26 +91,83 @@ def test_plan_poc_prefers_llm_plan_when_available(monkeypatch):
             self.content = content
 
     class FakeModel:
+        def __init__(self):
+            self.calls = 0
+
         def invoke(self, messages):
+            self.calls += 1
+            prompt = messages[-1].content
+            if "PoC Strategy Selector" in prompt:
+                return FakeResponse(
+                    '{"chosen_strategy":"llm_synthesized","rationale":"no reusable artifact","evidence":["patch-only"]}'
+                )
             return FakeResponse(
                 '{"trigger_mode":"cli-file","target_binary":"demo-bin","target_args":["--input","/workspace/artifacts/poc/payloads/llm.txt"],'
                 '"environment_variables":{},"payload_filename":"llm.txt","payload_content":"llm\\n","auxiliary_files":{},'
                 '"run_command":"demo-bin --input /workspace/artifacts/poc/payloads/llm.txt","expected_exit_code":null,'
                 '"expected_stdout_patterns":[],"expected_stderr_patterns":["segmentation fault"],"expected_crash_type":"segmentation fault",'
-                '"source_of_truth":"llm","confidence":"high","rationale":"llm plan","dockerfile_override":null,"run_script_override":null}'
+                '"source_of_truth":"llm_synthesized","confidence":"high","rationale":"llm plan","dockerfile_override":null,"run_script_override":null}'
             )
 
-    monkeypatch.setattr(poc_module, "build_chat_model", lambda *args, **kwargs: FakeModel())
+    fake_model = FakeModel()
+    monkeypatch.setattr(poc_module, "build_chat_model", lambda *args, **kwargs: fake_model)
 
     stage = poc_module.PocStage()
     knowledge = make_knowledge(expected_error_patterns=["segmentation fault"])
     build = make_build()
-    context = poc_module.PocContext(cve_id=knowledge.cve_id)
+    context = poc_module.PocContext(
+        cve_id=knowledge.cve_id,
+        reference_poc_summaries=["SUMMARY: dataset poc"],
+    )
 
     plan = stage.plan_poc(knowledge=knowledge, build=build, context=context)
 
-    assert plan.source_of_truth == "llm"
+    assert plan.source_of_truth == "llm_synthesized"
     assert plan.payload_filename == "llm.txt"
+    assert context.chosen_strategy == "llm_synthesized"
+    assert fake_model.calls == 2
+
+
+def test_plan_poc_reuses_selected_strategy_without_reselecting(monkeypatch):
+    class FakeResponse:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            prompt = messages[-1].content
+            if "PoC Strategy Selector" in prompt:
+                return FakeResponse(
+                    '{"chosen_strategy":"dataset_poc","rationale":"existing payload","evidence":["dataset poc"]}'
+                )
+            return FakeResponse(
+                '{"trigger_mode":"cli-file","target_binary":"demo-bin","target_args":["/workspace/artifacts/poc/payloads/llm.txt"],'
+                '"environment_variables":{},"payload_filename":"llm.txt","payload_content":"llm\\n","auxiliary_files":{},'
+                '"run_command":"demo-bin /workspace/artifacts/poc/payloads/llm.txt","expected_exit_code":null,'
+                '"expected_stdout_patterns":[],"expected_stderr_patterns":["segmentation fault"],"expected_stack_keywords":[],"expected_crash_type":"segmentation fault",'
+                '"source_of_truth":"dataset_poc","confidence":"high","rationale":"plan","dockerfile_override":null,"run_script_override":null}'
+            )
+
+    fake_model = FakeModel()
+    monkeypatch.setattr(poc_module, "build_chat_model", lambda *args, **kwargs: fake_model)
+
+    stage = poc_module.PocStage()
+    knowledge = make_knowledge(expected_error_patterns=["segmentation fault"])
+    build = make_build()
+    context = poc_module.PocContext(
+        cve_id=knowledge.cve_id,
+        reference_poc_summaries=["SUMMARY: dataset poc"],
+    )
+
+    stage.plan_poc(knowledge=knowledge, build=build, context=context)
+    stage.plan_poc(knowledge=knowledge, build=build, context=context)
+
+    assert context.chosen_strategy == "dataset_poc"
+    assert fake_model.calls == 3
 
 
 def test_llm_prompt_includes_previous_run_artifacts():
@@ -207,7 +265,79 @@ def test_prompt_includes_structured_reproduction_recipes():
     assert "./demo {payload}" in prompt
 
 
-def test_plan_poc_falls_back_when_llm_unavailable(monkeypatch):
+def test_strategy_prompt_lists_available_choices():
+    stage = poc_module.PocStage()
+    knowledge = make_knowledge()
+    build = make_build()
+    context = poc_module.PocContext(
+        cve_id=knowledge.cve_id,
+        reproduction_recipe_summaries=["steps:\n- ./demo {payload}"],
+        reference_poc_summaries=["SUMMARY: dataset poc"],
+    )
+
+    prompt = stage._build_strategy_prompt(
+        knowledge=knowledge,
+        build=build,
+        context=context,
+    )
+
+    assert "Available strategies:" in prompt
+    assert "reproduction_recipe" in prompt
+    assert "dataset_poc" in prompt
+    assert "llm_synthesized" in prompt
+
+
+def test_prompt_requires_llm_synthesis_when_no_poc_evidence():
+    stage = poc_module.PocStage()
+    knowledge = make_knowledge(
+        reproduction_hints=[],
+        reproduction_recipes=[],
+        expected_error_patterns=["segmentation fault"],
+    )
+    build = make_build(binary_or_entrypoint="demo-bin")
+    context = poc_module.PocContext(
+        cve_id=knowledge.cve_id,
+        repo_evidence_blocks=["README: demo-bin accepts --input FILE"],
+        candidate_entrypoints=["demo-bin"],
+        inferred_input_modes=["file"],
+    )
+
+    prompt = stage._build_llm_prompt(
+        knowledge=knowledge,
+        build=build,
+        context=context,
+        previous_plan=None,
+        previous_artifact=None,
+    )
+
+    assert "No explicit PoC or reproduction recipe was recovered" in prompt
+    assert "You must synthesize the smallest plausible trigger" in prompt
+    assert "source_of_truth to llm_synthesized" in prompt
+
+
+def test_llm_prompt_pins_selected_strategy():
+    stage = poc_module.PocStage()
+    knowledge = make_knowledge()
+    build = make_build(binary_or_entrypoint="demo-bin")
+    context = poc_module.PocContext(
+        cve_id=knowledge.cve_id,
+        chosen_strategy="dataset_poc",
+        chosen_strategy_rationale="existing poc needs adaptation",
+    )
+
+    prompt = stage._build_llm_prompt(
+        knowledge=knowledge,
+        build=build,
+        context=context,
+        previous_plan=None,
+        previous_artifact=None,
+    )
+
+    assert "The strategy for this attempt is fixed to: dataset_poc." in prompt
+    assert "Strategy rationale: existing poc needs adaptation" in prompt
+
+
+def test_plan_poc_raises_when_llm_unavailable(monkeypatch):
     monkeypatch.setattr(poc_module, "build_chat_model", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("missing key")))
 
     stage = poc_module.PocStage()
@@ -215,67 +345,12 @@ def test_plan_poc_falls_back_when_llm_unavailable(monkeypatch):
     build = make_build(binary_or_entrypoint="demo-bin")
     context = poc_module.PocContext(cve_id=knowledge.cve_id, target_binary="demo-bin")
 
-    plan = stage.plan_poc(knowledge=knowledge, build=build, context=context)
-
-    assert plan.target_binary == "demo-bin"
-    assert plan.source_of_truth in {"heuristic", "dataset_poc"}
-
-
-def test_heuristic_plan_prefers_reproduction_recipe_payload_over_dataset_poc():
-    stage = poc_module.PocStage()
-    knowledge = make_knowledge(
-        repo_url="https://github.com/lua/lua.git",
-        reproduction_recipes=[
-            ReproductionRecipe(
-                source_url="https://osv.dev/reference",
-                source_title="OSV reference",
-                steps=[
-                    "git clone https://github.com/lua/lua -q",
-                    "cd lua/ && make -j$(nproc)",
-                    'echo -n "cHJpbnQoJ29rJyk=" | base64 -d > poc.lua',
-                    "./lua ./poc.lua",
-                ],
-                artifact_generation_commands=['echo -n "cHJpbnQoJ29rJyk=" | base64 -d > poc.lua'],
-                run_commands=["./lua ./poc.lua"],
-                source_excerpt="How to reproduce...",
-                confidence="high",
-            )
-        ],
-    )
-    build = make_build(binary_or_entrypoint="lua")
-    context = poc_module.PocContext(cve_id=knowledge.cve_id, repo_url="https://github.com/lua/lua.git")
-
-    plan = stage._normalize_poc_plan(
-        stage._heuristic_poc_plan(knowledge=knowledge, build=build, context=context),
-        repo_url=knowledge.repo_url or "",
-    )
-
-    assert plan.source_of_truth == "reproduction_recipe"
-    assert plan.payload_filename == "poc.lua"
-    assert plan.payload_content == "print('ok')\n"
-    assert plan.target_binary == "/src/lua/lua"
-    assert plan.run_command == "'/src/lua/lua' /workspace/artifacts/poc/payloads/poc.lua"
-
-
-def test_recipe_run_command_selection_ignores_non_command_noise():
-    stage = poc_module.PocStage()
-    recipe = ReproductionRecipe(
-        steps=[
-            "Lua version:",
-            "Lua 5.4.4 Copyright (C) 1994-2022 Lua.org, PUC-Rio",
-            "git clone https://github.com/lua/lua -q",
-            "./lua ./poc",
-        ],
-        run_commands=[
-            "Lua version:",
-            "Lua 5.4.4 Copyright (C) 1994-2022 Lua.org, PUC-Rio",
-            "./lua ./poc",
-        ],
-    )
-
-    command = stage._select_recipe_run_command(recipe, "poc")
-
-    assert command == "./lua ./poc"
+    try:
+        stage.plan_poc(knowledge=knowledge, build=build, context=context)
+    except RuntimeError as error:
+        assert "poc_agent did not return a valid strategy" in str(error)
+    else:
+        raise AssertionError("expected plan_poc to fail without an llm plan")
 
 
 def test_try_llm_plan_rejects_non_triggering_replan_without_substantive_changes(tmp_path, monkeypatch):
@@ -412,6 +487,51 @@ def test_try_llm_plan_retries_timeout_twice_before_success(tmp_path, monkeypatch
     assert plan is not None
     assert fake_model.calls == 3
     assert (paths.llm_dir / "attempt-4" / "response.txt").exists()
+
+
+def test_try_llm_plan_uses_dedicated_poc_timeout(tmp_path, monkeypatch):
+    class FakeResponse:
+        def __init__(self, content):
+            self.content = content
+
+    captured = {}
+
+    class FakeModel:
+        def invoke(self, messages):
+            return FakeResponse(
+                '{"trigger_mode":"cli-file","target_binary":"demo-bin","target_args":["/workspace/artifacts/poc/payloads/llm.txt"],'
+                '"environment_variables":{},"payload_filename":"llm.txt","payload_content":"llm\\n","auxiliary_files":{},'
+                '"run_command":"demo-bin /workspace/artifacts/poc/payloads/llm.txt","expected_exit_code":null,'
+                '"expected_stdout_patterns":[],"expected_stderr_patterns":["segmentation fault"],"expected_stack_keywords":[],"expected_crash_type":"segmentation fault",'
+                '"source_of_truth":"llm","confidence":"high","rationale":"timeout capture","dockerfile_override":null,"run_script_override":null}'
+            )
+
+    def fake_build_chat_model(agent_name, model_name=None, temperature=0, timeout_seconds=None):
+        captured["agent_name"] = agent_name
+        captured["timeout_seconds"] = timeout_seconds
+        return FakeModel()
+
+    monkeypatch.setattr(poc_module, "build_chat_model", fake_build_chat_model)
+    monkeypatch.setattr(
+        poc_module,
+        "load_app_config",
+        lambda: SimpleNamespace(runtime=SimpleNamespace(poc_agent_timeout_seconds=95)),
+    )
+
+    stage = poc_module.PocStage()
+    paths = poc_module.PocStagePaths(str(tmp_path / "ws"))
+    stage._prepare_workspace(paths)
+    stage._active_poc_dir = str(paths.poc_dir)
+
+    plan = stage._try_llm_poc_plan(
+        knowledge=make_knowledge(expected_error_patterns=["segmentation fault"]),
+        build=make_build(binary_or_entrypoint="demo-bin"),
+        context=poc_module.PocContext(cve_id="CVE-2022-28805", planner_attempt=6),
+    )
+
+    assert plan is not None
+    assert captured["agent_name"] == "poc_agent"
+    assert captured["timeout_seconds"] == 95
 
 
 def test_try_llm_plan_records_final_error_after_three_empty_responses(tmp_path, monkeypatch):

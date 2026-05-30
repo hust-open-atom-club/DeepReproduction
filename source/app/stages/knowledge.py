@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -154,6 +153,13 @@ class KnowledgeStage:
                 selected_references,
                 skipped_references,
             ) = self.collect_evidence(selected_references, skipped_references, paths)
+            existing_pages, existing_evidence_files, existing_patch_summaries = self.load_existing_evidence(paths)
+            if existing_evidence_files:
+                local_evidence_files = dedupe_preserve_order([*local_evidence_files, *existing_evidence_files])
+            if not fetched_pages and existing_pages:
+                fetched_pages = existing_pages
+            if not patch_summaries and existing_patch_summaries:
+                patch_summaries = existing_patch_summaries
             ensure_empty_file(paths.patch_diff)
 
             source_registry = KnowledgeSourcesModel(
@@ -179,10 +185,14 @@ class KnowledgeStage:
                 raise RuntimeError(f"Failed to bootstrap references from OSV: {bootstrap_error}")
 
             if not fetched_pages and not patch_summaries and not local_evidence_files:
-                if selected_references:
+                bootstrap_page = self._build_bootstrap_fallback_page(task, source_registry.selected_references)
+                if bootstrap_page is not None:
+                    fetched_pages = [bootstrap_page]
+                elif selected_references:
                     failed_urls = ", ".join(record.url for record in selected_references[:5])
                     raise RuntimeError(f"Failed to fetch any evidence from selected references. First targets: {failed_urls}")
-                raise RuntimeError("Knowledge stage produced no references and no evidence.")
+                else:
+                    raise RuntimeError("Knowledge stage produced no references and no evidence.")
 
             knowledge = self.synthesize_knowledge(
                 task=task,
@@ -389,6 +399,85 @@ class KnowledgeStage:
             patch_summaries,
             list(selected_by_url.values()),
             list(skipped_by_url.values()),
+        )
+
+    def load_existing_evidence(self, paths: KnowledgePaths) -> tuple[List[FetchedPage], List[str], List[PatchSummary]]:
+        """Load curated local evidence from the dataset when remote fetching is unavailable."""
+
+        fetched_pages: list[FetchedPage] = []
+        evidence_files: list[str] = []
+        patch_summaries: list[PatchSummary] = []
+
+        for cleaned_path in sorted(paths.cleaned_dir.glob("*.md")):
+            content = cleaned_path.read_text(encoding="utf-8", errors="replace")
+            title = ""
+            url = cleaned_path.resolve().as_uri()
+            body = content
+            lines = content.splitlines()
+            if lines and lines[0].startswith("# "):
+                title = lines[0][2:].strip()
+                body = "\n".join(lines[1:]).lstrip()
+            source_match = re.search(r"^Source:\s*(\S+)\s*$", content, re.MULTILINE)
+            if source_match:
+                url = source_match.group(1).strip()
+                body = content[source_match.end():].lstrip()
+            fetched_pages.append(
+                FetchedPage(
+                    url=url,
+                    title=title,
+                    html="",
+                    cleaned_text=body.strip(),
+                    status_code=200,
+                    content_type="text/markdown",
+                    local_path=str(cleaned_path),
+                    links=[],
+                )
+            )
+            evidence_files.append(str(cleaned_path))
+
+        if paths.patch_diff.exists():
+            diff_text = paths.patch_diff.read_text(encoding="utf-8", errors="replace")
+            if diff_text.strip():
+                patch_summaries.append(self.patches.parse_diff(diff_text))
+                evidence_files.append(str(paths.patch_diff))
+
+        for directory in (paths.raw_dir, paths.extracted_dir, paths.pocs_dir):
+            if not directory.exists():
+                continue
+            for file_path in sorted(path for path in directory.rglob("*") if path.is_file()):
+                evidence_files.append(str(file_path))
+
+        return fetched_pages, dedupe_preserve_order(evidence_files), patch_summaries
+
+    def _build_bootstrap_fallback_page(
+        self,
+        task: TaskModel,
+        selected_references: List[ReferenceRecord],
+    ) -> Optional[FetchedPage]:
+        """Build a minimal synthetic evidence page from bootstrap task metadata."""
+
+        reference_urls = [record.url for record in selected_references[:8] if record.url]
+        lines = [
+            f"CVE: {task.cve_id}",
+            f"Repository: {task.repo_url or ''}",
+            f"Vulnerable ref: {task.vulnerable_ref or ''}",
+            f"Fixed ref: {task.fixed_ref or ''}",
+        ]
+        if reference_urls:
+            lines.append("References:")
+            lines.extend(reference_urls)
+        cleaned_text = "\n".join(line for line in lines if line.strip()).strip()
+        if not cleaned_text:
+            return None
+        return FetchedPage(
+            url=task.cve_url or (reference_urls[0] if reference_urls else f"task:{task.cve_id}"),
+            title=f"Bootstrap metadata for {task.cve_id}",
+            html="",
+            cleaned_text=cleaned_text,
+            status_code=200,
+            content_type="text/plain",
+            local_path=None,
+            links=[],
         )
 
     def discover_child_references(
@@ -891,15 +980,6 @@ def prepare_layout(paths: KnowledgePaths) -> None:
 
 def reset_stage_outputs(paths: KnowledgePaths) -> None:
     """Clear stage-owned outputs before writing a fresh run."""
-
-    for directory in (paths.raw_dir, paths.cleaned_dir, paths.extracted_dir, paths.diff_dir, paths.pocs_dir):
-        if not directory.exists():
-            continue
-        for child in directory.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
 
     for path in (paths.knowledge_yaml, paths.runtime_state_yaml, paths.knowledge_sources_yaml):
         if path.exists():
@@ -1735,7 +1815,9 @@ def build_reproduction_hints(task: TaskModel, fetched_pages: List[FetchedPage], 
 
 _REPRO_SECTION_KEYWORDS = (
     "how to reproduce",
+    "how to reprocude",
     "reproduce",
+    "reprocude",
     "reproducer",
     "proof of concept",
     "poc",
@@ -1752,7 +1834,7 @@ _COMMAND_START_RE = re.compile(
     re.IGNORECASE,
 )
 
-_RUN_COMMAND_HINTS = ("./", "lua ", "python ", "python3 ", "node ", "perl ", "ruby ")
+_RUN_COMMAND_PREFIXES = ("./", "lua ", "python ", "python3 ", "node ", "perl ", "ruby ", "bash ", "sh ")
 _BUILD_COMMAND_HINTS = ("make", "cmake", "ninja", "cargo", "go build", "meson", "configure")
 
 
@@ -1814,6 +1896,10 @@ def extract_reproduction_recipes(fetched_pages: List[FetchedPage], limit: int = 
 
 
 def extract_reproduction_excerpt(cleaned_text: str, max_chars: int = 2400) -> str:
+    heading_excerpt = extract_reproduction_excerpt_from_lines(cleaned_text, max_chars=max_chars)
+    if heading_excerpt:
+        return heading_excerpt
+
     paragraphs = [segment.strip() for segment in re.split(r"\n\s*\n", cleaned_text) if segment.strip()]
     for index, paragraph in enumerate(paragraphs):
         lowered = paragraph.lower()
@@ -1833,6 +1919,35 @@ def extract_reproduction_excerpt(cleaned_text: str, max_chars: int = 2400) -> st
     return ""
 
 
+def extract_reproduction_excerpt_from_lines(cleaned_text: str, max_chars: int = 2400) -> str:
+    lines = [line.rstrip() for line in cleaned_text.splitlines()]
+    for index, line in enumerate(lines):
+        if not contains_reproduction_signal(line):
+            continue
+        command_lines: list[str] = []
+        collecting = False
+        for candidate in lines[index + 1 :]:
+            stripped = candidate.strip()
+            if not stripped:
+                if collecting:
+                    break
+                continue
+            if stripped.startswith(("---", "===", "***")):
+                if collecting:
+                    continue
+                continue
+            if is_numbered_or_command_line(stripped):
+                command_lines.append(stripped)
+                collecting = True
+                continue
+            if collecting:
+                break
+        if len(command_lines) >= 2:
+            excerpt = "\n".join([line.strip()] + command_lines)
+            return truncate_preserving_lines(excerpt, max_chars)
+    return ""
+
+
 def contains_reproduction_signal(text: str) -> bool:
     lowered = text.lower()
     return any(keyword in lowered for keyword in _REPRO_SECTION_KEYWORDS)
@@ -1844,12 +1959,8 @@ def looks_like_command_block(text: str) -> bool:
         stripped = line.strip()
         if not stripped:
             continue
-        if _COMMAND_START_RE.match(stripped):
+        if is_numbered_or_command_line(stripped):
             command_lines += 1
-        elif re.match(r"^\d+\.\s+", stripped):
-            payload = normalize_command_candidate(stripped)
-            if _COMMAND_START_RE.match(payload):
-                command_lines += 1
     return command_lines >= 2
 
 
@@ -1863,11 +1974,12 @@ def extract_recipe_steps(excerpt: str) -> List[str]:
         if _COMMAND_START_RE.match(normalized):
             steps.append(normalized)
             continue
-        if re.match(r"^\d+\.\s+", stripped):
-            numbered = normalize_command_candidate(stripped)
-            if _COMMAND_START_RE.match(numbered):
-                steps.append(numbered)
     return dedupe_preserve_order(steps)
+
+
+def is_numbered_or_command_line(line: str) -> bool:
+    normalized = normalize_command_candidate(line)
+    return bool(normalized and _COMMAND_START_RE.match(normalized))
 
 
 def classify_recipe_steps(steps: List[str], category: str) -> List[str]:
@@ -1880,7 +1992,7 @@ def classify_recipe_steps(steps: List[str], category: str) -> List[str]:
             selected.append(step)
         elif category == "artifact_generation" and any(token in lowered for token in ("base64", "cat ", "echo ", ">", "printf ")):
             selected.append(step)
-        elif category == "run" and any(token in lowered for token in _RUN_COMMAND_HINTS):
+        elif category == "run" and lowered.startswith(_RUN_COMMAND_PREFIXES):
             selected.append(step)
     return dedupe_preserve_order(selected)
 
