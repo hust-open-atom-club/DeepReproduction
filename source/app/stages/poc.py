@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import re
 from pathlib import Path
@@ -28,7 +27,7 @@ except ModuleNotFoundError:  # pragma: no cover
     FileSystemLoader = None
     StrictUndefined = None
 
-from app.config import build_chat_model
+from app.config import build_chat_model, load_app_config
 from app.schemas.build_artifact import BuildArtifact
 from app.schemas.knowledge import KnowledgeModel, ReproductionRecipe
 from app.schemas.poc_artifact import PoCArtifact
@@ -92,6 +91,8 @@ class PocContext(BaseModel):
     candidate_cli_flags: list[str] = Field(default_factory=list, description="Command-line flags discovered from hints.")
     reference_poc_summaries: list[str] = Field(default_factory=list, description="Reference PoC summaries.")
     repo_evidence_blocks: list[str] = Field(default_factory=list, description="README/tests/examples excerpts.")
+    chosen_strategy: str = Field(default="", description="Strategy selected for this PoC run.")
+    chosen_strategy_rationale: str = Field(default="", description="Why the current strategy was selected.")
     previous_failure_kind: str = Field(default="", description="Previous PoC failure kind.")
     previous_execution_log: str = Field(default="", description="Previous PoC execution log excerpt.")
     previous_run_script_content: str = Field(default="", description="Previous rendered run script content.")
@@ -213,22 +214,12 @@ class PocGraphState(TypedDict, total=False):
     attempt: int
 
 
-class PocFallbackSpec(BaseModel):
-    """Deterministic fallback planning spec for the PoC stage."""
+class PocStrategyDecision(BaseModel):
+    """High-level strategy decision before generating a concrete PoC."""
 
-    trigger_mode: str = "cli-file"
-    target_binary: str = ""
-    target_args: list[str] = Field(default_factory=list)
-    payload_filename: str = "poc.txt"
-    payload_content: str = ""
-    run_command: str = ""
-    expected_stdout_patterns: list[str] = Field(default_factory=list)
-    expected_stderr_patterns: list[str] = Field(default_factory=list)
-    expected_stack_keywords: list[str] = Field(default_factory=list)
-    expected_crash_type: str = ""
-    source_of_truth: str = "heuristic"
-    confidence: str = "medium"
-    rationale: str = ""
+    chosen_strategy: str = Field(default="llm_synthesized", description="Selected strategy.")
+    rationale: str = Field(default="", description="Reason for choosing the strategy.")
+    evidence: list[str] = Field(default_factory=list, description="Short evidence bullets supporting the strategy.")
 
 
 class PocPlanner:
@@ -238,13 +229,91 @@ class PocPlanner:
         self.stage = stage
 
     def plan(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> PocPlan:
+        if not context.chosen_strategy:
+            strategy = self.select_strategy(knowledge=knowledge, build=build, context=context)
+            if strategy is None:
+                raise RuntimeError("poc_agent did not return a valid strategy.")
+            context.chosen_strategy = strategy.chosen_strategy
+            context.chosen_strategy_rationale = strategy.rationale
         llm_plan = self.try_llm_plan(knowledge=knowledge, build=build, context=context)
         if llm_plan is not None:
             return self.stage._normalize_poc_plan(llm_plan, repo_url=context.repo_url)
-        return self.stage._normalize_poc_plan(
-            self.heuristic_plan(knowledge=knowledge, build=build, context=context),
-            repo_url=context.repo_url,
+        raise RuntimeError("poc_agent did not return a valid plan.")
+
+    def select_strategy(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> Optional[PocStrategyDecision]:
+        try:
+            model = build_chat_model(
+                "poc_agent",
+                temperature=0,
+                timeout_seconds=load_app_config().runtime.poc_agent_timeout_seconds,
+            )
+        except Exception:
+            return None
+
+        prompt = self.stage._build_strategy_prompt(knowledge=knowledge, build=build, context=context)
+        self.stage._persist_poc_strategy_trace(context.planner_attempt, "prompt.txt", prompt)
+        retry_errors: list[str] = []
+        max_attempts = self.stage.MAX_LLM_NO_RESPONSE_RETRIES + 1
+        for invoke_attempt in range(1, max_attempts + 1):
+            try:
+                response = model.invoke(
+                    [
+                        SystemMessage(content="You return strict JSON only."),
+                        HumanMessage(content=prompt),
+                    ]
+                )
+                raw_response = getattr(response, "content", response)
+                raw_response_text = str(raw_response)
+                if self.stage._is_empty_llm_response(raw_response_text):
+                    retry_errors.append(f"Attempt {invoke_attempt}: empty response")
+                    if invoke_attempt < max_attempts:
+                        continue
+                    self.stage._persist_poc_strategy_trace(
+                        context.planner_attempt,
+                        "error.txt",
+                        "LLM returned no content after 3 attempts.",
+                    )
+                    return None
+                self.stage._persist_poc_strategy_trace(context.planner_attempt, "response.txt", raw_response_text)
+                parsed = parse_llm_json_payload(raw_response)
+                if parsed is None:
+                    self.stage._persist_poc_strategy_trace(
+                        context.planner_attempt,
+                        "error.txt",
+                        "LLM response could not be parsed into JSON.",
+                    )
+                    return None
+                self.stage._persist_poc_strategy_trace(
+                    context.planner_attempt,
+                    "parsed.json",
+                    json.dumps(parsed, ensure_ascii=False, indent=2),
+                )
+                decision = PocStrategyDecision(**parsed)
+                if decision.chosen_strategy not in self.stage._available_poc_strategies(context):
+                    self.stage._persist_poc_strategy_trace(
+                        context.planner_attempt,
+                        "error.txt",
+                        f"LLM selected unavailable strategy: {decision.chosen_strategy}",
+                    )
+                    return None
+                return decision
+            except Exception as error:
+                error_text = str(error)
+                retry_errors.append(f"Attempt {invoke_attempt}: {error_text}")
+                if self.stage._should_retry_llm_request(error_text) and invoke_attempt < max_attempts:
+                    continue
+                self.stage._persist_poc_strategy_trace(
+                    context.planner_attempt,
+                    "error.txt",
+                    "\n".join(retry_errors),
+                )
+                return None
+        self.stage._persist_poc_strategy_trace(
+            context.planner_attempt,
+            "error.txt",
+            "\n".join(retry_errors) or "LLM request failed without a response.",
         )
+        return None
 
     def replan_after_failure(
         self,
@@ -257,6 +326,8 @@ class PocPlanner:
         retry_context = context.model_copy(
             update={
                 "planner_attempt": context.planner_attempt + 1,
+                "chosen_strategy": context.chosen_strategy,
+                "chosen_strategy_rationale": context.chosen_strategy_rationale,
                 "previous_failure_kind": self.stage._classify_failure_kind(previous_artifact.execution_logs),
                 "previous_execution_log": previous_artifact.execution_logs[:6000],
             }
@@ -269,25 +340,6 @@ class PocPlanner:
             previous_artifact=previous_artifact,
         )
 
-    def heuristic_plan(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> PocPlan:
-        spec = self.stage._build_fallback_spec(knowledge=knowledge, build=build, context=context)
-        return PocPlan(
-            trigger_mode=spec.trigger_mode,
-            target_binary=spec.target_binary,
-            target_args=spec.target_args,
-            payload_filename=spec.payload_filename,
-            payload_content=spec.payload_content,
-            run_command=spec.run_command,
-            expected_exit_code=None,
-            expected_stdout_patterns=spec.expected_stdout_patterns,
-            expected_stderr_patterns=spec.expected_stderr_patterns,
-            expected_stack_keywords=spec.expected_stack_keywords,
-            expected_crash_type=spec.expected_crash_type,
-            source_of_truth=spec.source_of_truth,
-            confidence=spec.confidence,
-            rationale=spec.rationale,
-        )
-
     def try_llm_plan(
         self,
         knowledge: KnowledgeModel,
@@ -297,7 +349,11 @@ class PocPlanner:
         previous_artifact: Optional[PoCArtifact] = None,
     ) -> Optional[PocPlan]:
         try:
-            model = build_chat_model("poc_agent", temperature=0)
+            model = build_chat_model(
+                "poc_agent",
+                temperature=0,
+                timeout_seconds=load_app_config().runtime.poc_agent_timeout_seconds,
+            )
         except Exception:
             return None
 
@@ -526,66 +582,20 @@ class PocStage:
         self.file_tool.ensure_dir(str(attempt_dir))
         self.file_tool.write_text(str(attempt_dir / filename), (content or "").rstrip() + "\n")
 
+    def _persist_poc_strategy_trace(self, planner_attempt: int, filename: str, content: str) -> None:
+        poc_dir = getattr(self, "_active_poc_dir", None)
+        if not poc_dir:
+            return
+        attempt_dir = Path(poc_dir) / "strategy" / f"attempt-{planner_attempt}"
+        self.file_tool.ensure_dir(str(attempt_dir))
+        self.file_tool.write_text(str(attempt_dir / filename), (content or "").rstrip() + "\n")
+
     def _write_yaml_file(self, path: Path, payload: Any) -> None:
         """Persist YAML using one consistent formatting policy."""
 
         self.file_tool.write_text(
             str(path),
             yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
-        )
-
-    def _heuristic_poc_plan(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> PocPlan:
-        return self.planner.heuristic_plan(knowledge=knowledge, build=build, context=context)
-
-    def _build_fallback_spec(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> PocFallbackSpec:
-        """Assemble all heuristic PoC decisions in one place."""
-
-        reference_poc = self._load_reference_poc(knowledge.cve_id)
-        payload_filename = "poc.txt"
-        payload_content = "trigger\n"
-        source_of_truth = "heuristic"
-        rationale = "Fallback PoC generated from knowledge hints and build artifact."
-        confidence = "medium"
-        recipe_plan = self._materialize_recipe_plan(knowledge.reproduction_recipes)
-        if recipe_plan is not None:
-            payload_filename = recipe_plan["payload_filename"]
-            payload_content = recipe_plan["payload_content"]
-            source_of_truth = "reproduction_recipe"
-            rationale = "Materialized the payload and trigger from a reproduction recipe preserved in knowledge."
-            confidence = recipe_plan["confidence"]
-        elif reference_poc is not None:
-            payload_filename = reference_poc[0]
-            payload_content = reference_poc[1]
-            source_of_truth = "dataset_poc"
-            rationale = "Adopted the dataset-provided PoC as the primary payload."
-            confidence = "high"
-
-        target_binary = self._select_target_binary(build, context, payload_filename)
-        target_args = self._select_target_args(
-            knowledge,
-            payload_filename,
-            context,
-            target_binary,
-            recipe_run_command=recipe_plan["run_command"] if recipe_plan is not None else "",
-        )
-        run_command = self._build_run_command(target_binary, target_args)
-        if recipe_plan is not None and recipe_plan["run_command"]:
-            run_command = self._normalize_recipe_run_command(recipe_plan["run_command"], payload_filename)
-
-        return PocFallbackSpec(
-            trigger_mode=self._infer_trigger_mode(payload_filename, context),
-            target_binary=target_binary,
-            target_args=target_args,
-            payload_filename=payload_filename,
-            payload_content=payload_content,
-            run_command=run_command,
-            expected_stdout_patterns=[],
-            expected_stderr_patterns=list(knowledge.expected_error_patterns),
-            expected_stack_keywords=list(knowledge.expected_stack_keywords),
-            expected_crash_type=self._infer_expected_crash_type(knowledge),
-            source_of_truth=source_of_truth,
-            confidence=confidence,
-            rationale=rationale,
         )
 
     def _try_llm_poc_plan(
@@ -604,6 +614,56 @@ class PocStage:
             previous_artifact=previous_artifact,
         )
 
+    def _available_poc_strategies(self, context: PocContext) -> list[str]:
+        strategies = ["llm_synthesized"]
+        if context.reproduction_recipe_summaries:
+            strategies.insert(0, "reproduction_recipe")
+        if context.reference_poc_summaries:
+            insert_at = 1 if strategies and strategies[0] == "reproduction_recipe" else 0
+            strategies.insert(insert_at, "dataset_poc")
+        return strategies
+
+    def _build_strategy_prompt(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> str:
+        available_strategies = self._available_poc_strategies(context)
+        sections = [
+            "You are the PoC Strategy Selector for a vulnerability reproduction framework.",
+            "Choose exactly one strategy for generating the next PoC attempt.",
+            "The strategy must stay stable across later retry turns unless the implementation proves it impossible.",
+            "Return exactly one JSON object and no markdown fences.",
+            "Schema:",
+            json.dumps(
+                {
+                    "chosen_strategy": "reproduction_recipe|dataset_poc|llm_synthesized",
+                    "rationale": "string",
+                    "evidence": ["string"],
+                },
+                ensure_ascii=True,
+            ),
+            f"Available strategies: {json.dumps(available_strategies, ensure_ascii=False)}",
+            f"CVE: {knowledge.cve_id}",
+            f"Summary: {knowledge.summary}",
+            f"Vulnerability type: {knowledge.vulnerability_type}",
+            f"Build target binary: {build.binary_or_entrypoint or build.expected_binary_path or ''}",
+            f"Expected error patterns: {json.dumps(knowledge.expected_error_patterns, ensure_ascii=False)}",
+            f"Expected stack keywords: {json.dumps(knowledge.expected_stack_keywords, ensure_ascii=False)}",
+            f"Reproduction hints: {json.dumps(knowledge.reproduction_hints, ensure_ascii=False)}",
+            "Structured reproduction recipes:",
+            "\n\n---\n\n".join(context.reproduction_recipe_summaries[:4]) or "<empty>",
+            "Reference PoC excerpts:",
+            "\n\n---\n\n".join(self._reference_poc_prompt_blocks(context.reference_poc_summaries, detailed=False)) or "<empty>",
+            f"Candidate entrypoints: {json.dumps(context.candidate_entrypoints, ensure_ascii=False)}",
+            f"Candidate CLI flags: {json.dumps(context.candidate_cli_flags, ensure_ascii=False)}",
+            f"Inferred input modes: {json.dumps(context.inferred_input_modes, ensure_ascii=False)}",
+            f"Patch changed functions: {json.dumps(context.patch_changed_functions, ensure_ascii=False)}",
+            f"Patch added checks: {json.dumps(context.patch_added_checks, ensure_ascii=False)}",
+            f"Patch error strings: {json.dumps(context.patch_error_strings, ensure_ascii=False)}",
+            "Patch excerpt:",
+            context.patch_diff_excerpt or "<empty>",
+            "Repository evidence excerpts:",
+            "\n\n---\n\n".join(context.repo_evidence_blocks[:4]) or "<empty>",
+        ]
+        return "\n".join(sections)
+
     def _build_llm_prompt(
         self,
         knowledge: KnowledgeModel,
@@ -616,9 +676,13 @@ class PocStage:
             context.reference_poc_summaries,
             detailed=previous_plan is not None,
         )
+        has_reference_evidence = bool(context.reproduction_recipe_summaries or reference_poc_blocks)
         sections = [
             "You are the PoC Agent for a vulnerability reproduction framework.",
             "Infer the most plausible minimal reproducer from patch context, repository evidence, build outputs, and existing hints.",
+            f"The strategy for this attempt is fixed to: {context.chosen_strategy or 'llm_synthesized'}.",
+            f"Strategy rationale: {context.chosen_strategy_rationale or '<empty>'}",
+            "Use that strategy to build the concrete PoC plan. Do not silently switch strategies inside this turn.",
             "Give substantial weight to semantic understanding of the vulnerability and the likely trigger path.",
             "Prefer a minimal reproducible trigger over a large script.",
             "Adapt any existing PoC or hint to the current workspace layout inside Docker.",
@@ -678,6 +742,32 @@ class PocStage:
             "Reference PoC excerpts:",
             "\n\n---\n\n".join(reference_poc_blocks) or "<empty>",
         ]
+        if not has_reference_evidence:
+            sections.extend(
+                [
+                    "Recovered PoC evidence status:",
+                    "No explicit PoC or reproduction recipe was recovered from the knowledge sources.",
+                    "You must synthesize the smallest plausible trigger from patch semantics, repository evidence, build outputs, candidate entrypoints, input-mode hints, and expected crash behavior.",
+                    "A synthesized PoC is valid even if it is only a minimal argument string, input file, or wrapper script that exercises the vulnerable path.",
+                    "When you are synthesizing instead of adapting an existing artifact, set source_of_truth to llm_synthesized.",
+                ]
+            )
+        elif context.chosen_strategy == "reproduction_recipe":
+            sections.extend(
+                [
+                    "Strategy guidance:",
+                    "Use the structured reproduction recipes as the primary source of truth for payload construction and triggering.",
+                    "You may simplify, decode, wrap, or relocate the recipe steps, but keep the recipe semantics.",
+                ]
+            )
+        elif context.chosen_strategy == "dataset_poc":
+            sections.extend(
+                [
+                    "Strategy guidance:",
+                    "Use the dataset PoC excerpts as the primary source of truth, but you may decode, rename, wrap, or otherwise adapt them before execution.",
+                    "Do not assume the dataset PoC is directly runnable without transformation.",
+                ]
+            )
 
         if previous_plan is not None and previous_artifact is not None:
             failure_kind = context.previous_failure_kind or self._classify_failure_kind(previous_artifact.execution_logs)
@@ -697,6 +787,7 @@ class PocStage:
                     context.previous_payload_content or "<empty>",
                     "Previous run_verify.yaml:",
                     context.previous_run_verify_report or "<empty>",
+                    f"Keep using strategy: {context.chosen_strategy or 'llm_synthesized'} unless the logs prove it impossible.",
                     "Adjust the plan to improve the trigger while staying minimal.",
                     "Replan contract:",
                     "- If docker image build failed, you must return a new dockerfile_override.",
@@ -1251,94 +1342,6 @@ class PocStage:
 
     def _is_empty_llm_response(self, raw_response: str) -> bool:
         return not (raw_response or "").strip()
-
-    def _load_reference_poc(self, cve_id: str) -> Optional[tuple[str, str]]:
-        for prefix in ("Dataset", "source/Dataset"):
-            poc_dir = Path(prefix) / cve_id / "vuln_data" / "vuln_pocs"
-            if not poc_dir.exists():
-                continue
-            for path in sorted(poc_dir.iterdir()):
-                if path.is_file():
-                    return path.name, path.read_text(encoding="utf-8", errors="replace")
-        return None
-
-    def _materialize_recipe_plan(self, recipes: list[ReproductionRecipe]) -> Optional[dict[str, str]]:
-        for recipe in recipes:
-            if not recipe.steps:
-                continue
-            payload = self._payload_from_recipe(recipe)
-            if payload is None:
-                continue
-            return {
-                "payload_filename": payload["payload_filename"],
-                "payload_content": payload["payload_content"],
-                "run_command": self._select_recipe_run_command(recipe, payload["payload_filename"]),
-                "confidence": recipe.confidence or "medium",
-            }
-        return None
-
-    def _payload_from_recipe(self, recipe: ReproductionRecipe) -> Optional[dict[str, str]]:
-        commands = list(recipe.artifact_generation_commands) or list(recipe.steps)
-        for command in commands:
-            parsed = self._decode_base64_payload_command(command)
-            if parsed is not None:
-                return parsed
-        return None
-
-    def _decode_base64_payload_command(self, command: str) -> Optional[dict[str, str]]:
-        match = re.search(
-            r'echo\s+-n\s+"(?P<data>[A-Za-z0-9+/=]+)"\s*\|\s*base64\s+-d\s*>\s*(?P<name>[A-Za-z0-9._/-]+)',
-            command,
-        )
-        if not match:
-            return None
-        try:
-            decoded = base64.b64decode(match.group("data"), validate=True).decode("utf-8")
-        except Exception:
-            return None
-        filename = Path(match.group("name")).name or "poc.txt"
-        if not decoded.endswith("\n"):
-            decoded += "\n"
-        return {
-            "payload_filename": filename,
-            "payload_content": decoded,
-        }
-
-    def _select_recipe_run_command(self, recipe: ReproductionRecipe, payload_filename: str) -> str:
-        payload_tokens = {payload_filename, f"./{payload_filename}", "{payload}"}
-        preferred: list[str] = []
-        fallback: list[str] = []
-        for command in list(recipe.run_commands) + list(recipe.steps):
-            normalized = (command or "").strip()
-            if not self._looks_like_recipe_command(normalized):
-                continue
-            if any(token in normalized for token in payload_tokens):
-                preferred.append(normalized)
-            else:
-                fallback.append(normalized)
-        if preferred:
-            return preferred[-1]
-        if fallback:
-            return fallback[-1]
-        return ""
-
-    def _looks_like_recipe_command(self, command: str) -> bool:
-        lowered = (command or "").strip().lower()
-        if not lowered or lowered.endswith(":"):
-            return False
-        command_prefixes = (
-            "./",
-            "/",
-            "lua ",
-            "python ",
-            "python3 ",
-            "perl ",
-            "ruby ",
-            "node ",
-            "bash ",
-            "sh ",
-        )
-        return lowered.startswith(command_prefixes)
 
     def _select_target_binary(self, build: BuildArtifact, context: PocContext, payload_filename: str = "") -> str:
         if build.binary_or_entrypoint:

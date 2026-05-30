@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from app.schemas.task import TaskModel
 from app.stages.knowledge import (
     KnowledgeSourcesModel,
     KnowledgeStage,
+    build_knowledge_paths,
     ReferenceRecord,
     derive_reference_variants,
     extract_reproduction_recipes,
@@ -168,6 +170,74 @@ class InferGitRefsTests(unittest.TestCase):
             extract_summary_candidate(page),
             "oss-fuzz-vulns/vulns/libredwg/OSV-2021-814.yaml at main · google/oss-fuzz-vulns",
         )
+
+    def test_run_uses_existing_local_evidence_when_remote_fetch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_root = Path(tmp_dir)
+            paths = build_knowledge_paths("CVE-LOCAL", dataset_root=str(dataset_root))
+            paths.cleaned_dir.mkdir(parents=True, exist_ok=True)
+            paths.diff_dir.mkdir(parents=True, exist_ok=True)
+            paths.cleaned_dir.joinpath("advisory.md").write_text(
+                "# Advisory\n\nSource: https://example.com/advisory\n\n"
+                "How to reproduce:\n1. ./demo poc\n\n"
+                "Heap overflow happens when parsing crafted input.\n",
+                encoding="utf-8",
+            )
+            paths.patch_diff.write_text(
+                "diff --git a/demo.c b/demo.c\n"
+                "--- a/demo.c\n"
+                "+++ b/demo.c\n"
+                "@@ -1,1 +1,2 @@\n"
+                "+ assert(ptr != NULL);\n",
+                encoding="utf-8",
+            )
+
+            stage = KnowledgeStage()
+            task = TaskModel(
+                task_id="CVE-LOCAL",
+                cve_id="CVE-LOCAL",
+                repo_url="https://example.com/demo.git",
+                vulnerable_ref="old",
+                fixed_ref="new",
+                references=["https://example.com/advisory"],
+                reference_details=[],
+            )
+
+            with patch.object(KnowledgeStage, "bootstrap_task", return_value=(task, None)), \
+                 patch.object(KnowledgeStage, "prioritize_references", return_value=([ReferenceRecord(url="https://example.com/advisory", selected=True)], [])), \
+                 patch.object(KnowledgeStage, "collect_evidence", return_value=([], [], [], [ReferenceRecord(url="https://example.com/advisory", selected=True)], [])), \
+                 patch.object(KnowledgeStage, "extract_and_write_poc", return_value=None):
+                knowledge = stage.run("CVE-LOCAL", dataset_root=str(dataset_root))
+
+            self.assertTrue(knowledge.summary)
+            self.assertTrue(knowledge.reproduction_hints)
+            self.assertIn("demo.c", knowledge.affected_files)
+
+    def test_run_falls_back_to_bootstrap_metadata_when_no_evidence_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_root = Path(tmp_dir)
+            stage = KnowledgeStage()
+            task = TaskModel(
+                task_id="CVE-MIN",
+                cve_id="CVE-MIN",
+                cve_url="https://example.com/cve/CVE-MIN",
+                repo_url="https://example.com/demo.git",
+                vulnerable_ref="old",
+                fixed_ref="new",
+                references=["https://example.com/advisory"],
+                reference_details=[],
+            )
+
+            with patch.object(KnowledgeStage, "bootstrap_task", return_value=(task, None)), \
+                 patch.object(KnowledgeStage, "prioritize_references", return_value=([ReferenceRecord(url="https://example.com/advisory", selected=True)], [])), \
+                 patch.object(KnowledgeStage, "collect_evidence", return_value=([], [], [], [ReferenceRecord(url="https://example.com/advisory", selected=True)], [])), \
+                 patch.object(KnowledgeStage, "extract_and_write_poc", return_value=None):
+                knowledge = stage.run("CVE-MIN", dataset_root=str(dataset_root))
+
+            self.assertEqual(knowledge.repo_url, "https://example.com/demo.git")
+            self.assertEqual(knowledge.vulnerable_ref, "old")
+            self.assertEqual(knowledge.fixed_ref, "new")
+            self.assertIn("https://example.com/advisory", knowledge.references)
 
     def test_recursive_crawl_rejects_github_navigation_pages(self) -> None:
         parent = "https://github.com/example/project/commit/abc123"
@@ -385,8 +455,53 @@ class InferGitRefsTests(unittest.TestCase):
         )
         self.assertIn("git clone https://github.com/lua/lua -q", recipes[0].repo_setup_commands)
         self.assertIn("cd lua/ && make -j$(nproc)", recipes[0].build_commands)
+        self.assertIn(
+            'echo -n "bG9jYWwgdSxfLE4sXyx3LE4sZCxXCmZ1bmN0aW9uIGMoRSxMLGwsUyxULHUsTSxULGwsaCxoLHUsdSxsLGgsaCx1LHUsTSx1LHUsdSxsLGgsaCxsKXM9cyBsb2NhbAllLGUsXyxfLE4sZSxzMCxOLFYsXyBmdW5jdGlvbiBjKGIsbClpLHM9TiBsb2NhbCBjIGxvY2FsIF9FTlY8Y29uc3Q+ID0wIG89MCBmdW5jdGlvbiBlKCllbmQ7ZSIicmV0dXJuIGVuZDtlMCxhLHcscyxzLHM9IiJyZXR1cm4jYyIiZW5kO2VlPSIicmV0dXJuDGMiIg==" | base64 -d > poc',
+            recipes[0].artifact_generation_commands,
+        )
         self.assertIn("./lua ./poc", recipes[0].run_commands)
         self.assertIn('base64 -d > poc', recipes[0].source_excerpt)
+
+    def test_reproduction_recipe_ignores_preamble_noise_before_heading_commands(self) -> None:
+        fetched_pages = [
+            FetchedPage(
+                url="https://lua-users.org/lists/lua-l/2022-02/msg00001.html",
+                title="lua-l report",
+                html="",
+                cleaned_text=(
+                    "Hi,\n"
+                    "I found a heap a heap buffer overflow on read in luaH_getshortstr function.\n"
+                    "Lua version:\n"
+                    "Lua 5.4.4 Copyright (C) 1994-2022 Lua.org, PUC-Rio\n"
+                    "How to reprocude:\n"
+                    "----------\n"
+                    "1. git clone https://github.com/lua/lua -q\n"
+                    "2. cd lua/ && make -j$(nproc)\n"
+                    '3. echo -n "AAAA" | base64 -d > poc\n'
+                    "4. ./lua ./poc\n"
+                    "----------\n"
+                    "Tested on Ubuntu-20.04 x86_64.\n"
+                ),
+                status_code=200,
+                content_type="text/html",
+                local_path=None,
+                links=[],
+            )
+        ]
+
+        recipes = extract_reproduction_recipes(fetched_pages)
+
+        self.assertEqual(len(recipes), 1)
+        self.assertEqual(
+            recipes[0].steps,
+            [
+                "git clone https://github.com/lua/lua -q",
+                "cd lua/ && make -j$(nproc)",
+                'echo -n "AAAA" | base64 -d > poc',
+                "./lua ./poc",
+            ],
+        )
+        self.assertEqual(recipes[0].run_commands, ["./lua ./poc"])
 
     def test_synthesize_knowledge_backfills_reproduction_recipes_from_heuristics(self) -> None:
         task = TaskModel(
