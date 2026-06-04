@@ -1,0 +1,27 @@
+#!/bin/bash
+set +e
+
+POC_ARTIFACTS_DIR="{{ poc_artifacts_dir }}"
+EXECUTION_DIR="{{ execution_dir }}"
+
+mkdir -p "${POC_ARTIFACTS_DIR}"
+cd "${EXECUTION_DIR}"
+
+echo "target_binary={{ target_binary }}"
+echo "trigger_command={{ run_command }}"
+
+stdout_file="${POC_ARTIFACTS_DIR}/stdout.txt"
+stderr_file="${POC_ARTIFACTS_DIR}/stderr.txt"
+
+{{ run_command }} >"${stdout_file}" 2>"${stderr_file}"
+execution_exit_code=$?
+
+echo "execution_exit_code=${execution_exit_code}"
+echo "stdout_begin"
+cat "${stdout_file}" 2>/dev/null || true
+echo "stdout_end"
+echo "stderr_begin"
+cat "${stderr_file}" 2>/dev/null || true
+echo "stderr_end"
+
+exit 0

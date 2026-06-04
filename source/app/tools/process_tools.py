@@ -1,4 +1,4 @@
-"""文件说明：进程执行工具接口。
+"""文件说明：进程执行工具。
 
 这个模块统一封装外部命令执行行为，
 供 Git、Docker、构建脚本和运行脚本等调用方复用。
@@ -6,6 +6,10 @@
 这样可以把超时控制、输出捕获、退出码判断等横切逻辑收敛在一处。
 """
 
+from __future__ import annotations
+
+import os
+import subprocess
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -30,9 +34,39 @@ class ProcessResult(BaseModel):
 
 
 class ProcessTool:
-    """命令执行接口。"""
+    """命令执行实现。"""
 
     def run(self, request: ProcessRequest) -> ProcessResult:
         """执行一个外部命令。"""
 
-        raise NotImplementedError
+        environment = os.environ.copy()
+        environment.update(request.environment)
+
+        try:
+            completed = subprocess.run(
+                request.command,
+                cwd=request.cwd,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=request.timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            stdout = error.stdout or ""
+            stderr = error.stderr or ""
+            return ProcessResult(
+                success=False,
+                exit_code=124,
+                stdout=stdout,
+                stderr=f"{stderr}\nprocess timed out after {request.timeout_seconds} seconds".strip(),
+            )
+        except FileNotFoundError as error:
+            return ProcessResult(success=False, exit_code=127, stdout="", stderr=str(error))
+
+        return ProcessResult(
+            success=completed.returncode == 0,
+            exit_code=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )

@@ -8,14 +8,20 @@
 - base_image: 可选基础镜像。若资料能判断漏洞时间窗口、目标发行版或编译环境，优先选择与漏洞日期相近的 Ubuntu 版本；缺乏明确证据时再使用默认 ubuntu:20.04。
 - apt_packages / extra_apt_packages: apt 安装包列表。除通用工具链外，应优先补充从知识证据中识别出的 repo-specific 编译依赖，例如头文件库、解释器 dev 包或构建工具插件。
 - src_root: 源码根目录，默认 /src。
-- vulnspace_root: 漏洞工件根目录，默认 /vulnspace。
+- workspace_root: 工作区根目录，默认 /workspace。
+- artifacts_root: 阶段产物根目录，默认 ${workspace_root}/artifacts。
+- build_artifacts_dir / poc_artifacts_dir / verify_artifacts_dir: 三阶段产物目录。
 - clone_submodules: 是否初始化 git submodule，默认 false。
 - extra_setup_commands: checkout 之后执行的额外准备命令列表。命令默认在 ${PROJECT_DIR} 内执行，建议保持可重复执行。
 - git_disable_ssl_verify: 是否关闭 git ssl 校验，默认 false。
 #}
 {% set base_image = base_image | default("ubuntu:20.04") %}
 {% set src_root = src_root | default("/src") %}
-{% set vulnspace_root = vulnspace_root | default("/vulnspace") %}
+{% set workspace_root = workspace_root | default("/workspace") %}
+{% set artifacts_root = artifacts_root | default(workspace_root ~ "/artifacts") %}
+{% set build_artifacts_dir = build_artifacts_dir | default(artifacts_root ~ "/build") %}
+{% set poc_artifacts_dir = poc_artifacts_dir | default(artifacts_root ~ "/poc") %}
+{% set verify_artifacts_dir = verify_artifacts_dir | default(artifacts_root ~ "/verify") %}
 {% set project_name = project_name | default("target") %}
 {% set project_dir_name = project_dir_name | default(project_name) %}
 {% set project_dir = project_dir | default(src_root ~ "/" ~ project_dir_name) %}
@@ -26,7 +32,9 @@
     "clang",
     "cmake",
     "curl",
+    "g++",
     "gdb",
+    "gcc",
     "git",
     "lld",
     "llvm",
@@ -46,8 +54,29 @@ FROM {{ base_image }}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG ALL_PROXY=""
+ARG NO_PROXY=""
+ARG http_proxy=""
+ARG https_proxy=""
+ARG all_proxy=""
+ARG no_proxy=""
+
 ENV DEBIAN_FRONTEND=noninteractive
-ENV VULNSPACE={{ vulnspace_root }}
+ENV HTTP_PROXY=${HTTP_PROXY}
+ENV HTTPS_PROXY=${HTTPS_PROXY}
+ENV ALL_PROXY=${ALL_PROXY}
+ENV NO_PROXY=${NO_PROXY}
+ENV http_proxy=${http_proxy}
+ENV https_proxy=${https_proxy}
+ENV all_proxy=${all_proxy}
+ENV no_proxy=${no_proxy}
+ENV WORKSPACE_ROOT={{ workspace_root }}
+ENV ARTIFACTS_ROOT={{ artifacts_root }}
+ENV BUILD_ARTIFACTS_DIR={{ build_artifacts_dir }}
+ENV POC_ARTIFACTS_DIR={{ poc_artifacts_dir }}
+ENV VERIFY_ARTIFACTS_DIR={{ verify_artifacts_dir }}
 ENV SRC_ROOT={{ src_root }}
 ENV PROJECT_DIR={{ project_dir }}
 
@@ -56,7 +85,13 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p "${SRC_ROOT}" "${VULNSPACE}"
+RUN mkdir -p \
+    "${SRC_ROOT}" \
+    "${WORKSPACE_ROOT}" \
+    "${ARTIFACTS_ROOT}" \
+    "${BUILD_ARTIFACTS_DIR}" \
+    "${POC_ARTIFACTS_DIR}" \
+    "${VERIFY_ARTIFACTS_DIR}"
 
 {% if git_disable_ssl_verify %}
 RUN git config --global http.sslVerify false
@@ -76,18 +111,17 @@ RUN set -eux; \
 {% endfor %}
 
 # Build-context precondition:
-# - vuln_data/vuln_pocs
-# - vuln_data/vuln_reports
-# - vuln_data/vuln_scripts
-# - vuln_data/vuln_diffs
-# These directories should exist in the build context even when some of them are empty.
+# - artifacts/build
+# - artifacts/poc
+# - artifacts/verify
+# The workspace root should be used as Docker build context so these stage
+# directories are available even when some of them are empty.
 
-COPY vuln_data/vuln_pocs ${VULNSPACE}/vuln_pocs
-COPY vuln_data/vuln_reports ${VULNSPACE}/vuln_reports
-COPY vuln_data/vuln_scripts ${VULNSPACE}/vuln_scripts
-COPY vuln_data/vuln_diffs ${VULNSPACE}/vuln_diffs
+COPY artifacts/build ${BUILD_ARTIFACTS_DIR}
+COPY artifacts/poc ${POC_ARTIFACTS_DIR}
+COPY artifacts/verify ${VERIFY_ARTIFACTS_DIR}
 
-RUN chmod +x ${VULNSPACE}/vuln_scripts/build.sh && \
-    chmod +x ${VULNSPACE}/vuln_scripts/run.sh
+RUN if [[ -f "${BUILD_ARTIFACTS_DIR}/build.sh" ]]; then chmod +x "${BUILD_ARTIFACTS_DIR}/build.sh"; fi && \
+    if [[ -f "${POC_ARTIFACTS_DIR}/run.sh" ]]; then chmod +x "${POC_ARTIFACTS_DIR}/run.sh"; fi
 
 WORKDIR ${PROJECT_DIR}

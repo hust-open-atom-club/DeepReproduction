@@ -1,0 +1,7 @@
+FROM {{ base_image_tag or "ubuntu:20.04" }}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+WORKDIR /workspace
+
+COPY artifacts/poc /workspace/artifacts/poc

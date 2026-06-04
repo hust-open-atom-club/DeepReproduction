@@ -1,0 +1,6 @@
+FROM {{ base_image_tag }}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# verify 阶段不在镜像层做任何事，依赖运行时挂载 /workspace
+WORKDIR /workspace

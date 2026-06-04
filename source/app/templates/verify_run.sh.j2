@@ -1,0 +1,100 @@
+#!/bin/bash
+set +e
+
+# Verify stage script. Honors $PATCH_MODE = pre | post.
+# All output follows the PoC log contract:
+#   target_binary=...
+#   trigger_command=...
+#   execution_exit_code=<int>
+#   stdout_begin / stdout_end
+#   stderr_begin / stderr_end
+# And adds verify-specific markers:
+#   patch_apply_exit_code=<int>           (post mode only)
+#   patch_apply_stderr_begin/end          (post mode only, always present in post)
+#   build_rebuild_exit_code=<int>
+
+PATCH_MODE="${PATCH_MODE:-pre}"
+PROJECT_DIR_VAR="{{ project_dir_var }}"
+
+# 防御：如果 PROJECT_DIR_VAR 在 bash 展开后是空的（多见于 LLM 重写 Dockerfile 没导出 PROJECT_DIR）
+if [[ -z "${PROJECT_DIR_VAR}" ]]; then
+    echo "execution_exit_code=255"
+    echo "stdout_begin"
+    echo "stdout_end"
+    echo "stderr_begin"
+    echo "PROJECT_DIR_VAR is empty after expansion (PROJECT_DIR likely not exported by image)."
+    echo "stderr_end"
+    exit 0
+fi
+
+VERIFY_DIR="/workspace/artifacts/verify"
+mkdir -p "${VERIFY_DIR}"
+
+cd "${PROJECT_DIR_VAR}" || {
+    echo "execution_exit_code=255"
+    echo "stdout_begin"
+    echo "stdout_end"
+    echo "stderr_begin"
+    echo "cd to PROJECT_DIR_VAR (${PROJECT_DIR_VAR}) failed"
+    echo "stderr_end"
+    exit 0
+}
+
+# Always reset to a clean state
+{{ repo_reset_command }} >/dev/null 2>&1
+
+if [[ "${PATCH_MODE}" == "post" ]]; then
+    patch_apply_stdout="${VERIFY_DIR}/patch_apply_stdout.txt"
+    patch_apply_stderr="${VERIFY_DIR}/patch_apply_stderr.txt"
+    {{ patch_apply_command }} >"${patch_apply_stdout}" 2>"${patch_apply_stderr}"
+    patch_apply_exit_code=$?
+    echo "patch_apply_exit_code=${patch_apply_exit_code}"
+    echo "patch_apply_stderr_begin"
+    cat "${patch_apply_stderr}" 2>/dev/null || true
+    echo "patch_apply_stderr_end"
+    if [[ ${patch_apply_exit_code} -ne 0 ]]; then
+        # patch apply 失败时，留给 verify_stage 上层判 inconclusive
+        echo "execution_exit_code=255"
+        echo "stdout_begin"
+        echo "stdout_end"
+        echo "stderr_begin"
+        echo "patch apply failed; skipping rebuild and trigger."
+        echo "stderr_end"
+        exit 0
+    fi
+fi
+
+# Rebuild
+{{ rebuild_command }} >/tmp/rebuild_stdout 2>/tmp/rebuild_stderr
+build_rebuild_exit_code=$?
+echo "build_rebuild_exit_code=${build_rebuild_exit_code}"
+if [[ ${build_rebuild_exit_code} -ne 0 ]]; then
+    echo "execution_exit_code=255"
+    echo "stdout_begin"
+    cat /tmp/rebuild_stdout 2>/dev/null || true
+    echo "stdout_end"
+    echo "stderr_begin"
+    cat /tmp/rebuild_stderr 2>/dev/null || true
+    echo "stderr_end"
+    exit 0
+fi
+
+# Trigger (PoC 同款契约)
+echo "target_binary={{ target_binary }}"
+echo "trigger_command={{ run_command }}"
+
+stdout_file="${VERIFY_DIR}/${PATCH_MODE}_stdout.txt"
+stderr_file="${VERIFY_DIR}/${PATCH_MODE}_stderr.txt"
+
+{{ run_command }} >"${stdout_file}" 2>"${stderr_file}"
+execution_exit_code=$?
+
+echo "execution_exit_code=${execution_exit_code}"
+echo "stdout_begin"
+cat "${stdout_file}" 2>/dev/null || true
+echo "stdout_end"
+echo "stderr_begin"
+cat "${stderr_file}" 2>/dev/null || true
+echo "stderr_end"
+
+exit 0

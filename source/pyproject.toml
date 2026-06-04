@@ -6,7 +6,9 @@ version = "0.0.1"
 description = "Vulnerability Reproduction Based on LLM Agents"
 authors = []
 dependencies = [
+    "Jinja2>=3.1.0",
     "langchain==1.0.0",
+    "langgraph>=1.0.0",
     "langchain-openai>=0.3.0",
     "python-dotenv>=1.0.1",
     "pydantic>=2.7.0",
@@ -18,3 +20,13 @@ license = {text = "None"}
 
 [tool.pdm]
 distribution = false
+
+[dependency-groups]
+test = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [
+    ".",
+]

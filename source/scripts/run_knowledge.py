@@ -7,6 +7,17 @@ import sys
 from pathlib import Path
 
 
+def configure_console_streams() -> None:
+    """Avoid Windows console encoding crashes when summaries contain Unicode."""
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        stream.reconfigure(encoding=encoding, errors="backslashreplace")
+
+
 def bootstrap_import_path() -> Path:
     """Ensure the source directory is importable when running the script directly."""
 
@@ -37,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     """Execute the knowledge stage and print the output file locations."""
 
+    configure_console_streams()
     bootstrap_import_path()
 
     from app.stages.knowledge import build_knowledge_paths, run_knowledge_agent
