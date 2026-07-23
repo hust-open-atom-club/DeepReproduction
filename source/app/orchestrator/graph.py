@@ -1,20 +1,18 @@
-"""文件说明：主流程图构建器。
+"""LangGraph v1 workflow assembly for the DeepReproduction multi-agent system."""
 
-这里统一定义 DeepReproduction 的主执行链路：
-knowledge -> build -> poc -> verify
+from __future__ import annotations
 
-这个文件只负责流程结构本身：
-- 注册节点
-- 指定入口
-- 声明边关系
-- 绑定路由函数
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
 
-它不处理阶段实现，也不处理模型、Docker 或文件系统细节。
-"""
-
-from langgraph.graph import END, StateGraph
-
-from app.orchestrator.routers import route_after_build, route_after_poc, route_after_verify
+from app.orchestrator.nodes import finalize_node, review_node
+from app.orchestrator.routers import (
+    route_after_build,
+    route_after_knowledge,
+    route_after_poc,
+    route_after_review,
+    route_after_verify,
+)
 from app.orchestrator.state import AppState
 from app.stages.build import build_node
 from app.stages.knowledge import knowledge_node
@@ -22,46 +20,69 @@ from app.stages.poc import poc_node
 from app.stages.verify import verify_node
 
 
-def build_app_graph():
-    """构造并编译主流程图。"""
+def build_app_graph(checkpointer=None):
+    """Construct and compile the LangGraph v1 workflow."""
 
-    graph = StateGraph(AppState)
+    builder = StateGraph(AppState)
 
-    graph.add_node("knowledge", knowledge_node)
-    graph.add_node("build", build_node)
-    graph.add_node("poc", poc_node)
-    graph.add_node("verify", verify_node)
+    builder.add_node("knowledge", knowledge_node)
+    builder.add_node("build", build_node)
+    builder.add_node("poc", poc_node)
+    builder.add_node("verify", verify_node)
+    builder.add_node("review", review_node)
+    builder.add_node("finalize", finalize_node)
 
-    graph.set_entry_point("knowledge")
-    graph.add_edge("knowledge", "build")
+    builder.add_edge(START, "knowledge")
 
-    graph.add_conditional_edges(
+    builder.add_conditional_edges(
+        "knowledge",
+        route_after_knowledge,
+        {
+            "build": "build",
+            "review": "review",
+            "finalize": "finalize",
+        },
+    )
+    builder.add_conditional_edges(
         "build",
         route_after_build,
         {
             "poc": "poc",
             "build": "build",
-            "failed": END,
+            "review": "review",
         },
     )
-
-    graph.add_conditional_edges(
+    builder.add_conditional_edges(
         "poc",
         route_after_poc,
         {
             "verify": "verify",
             "poc": "poc",
-            "failed": END,
+            "review": "review",
         },
     )
-
-    graph.add_conditional_edges(
+    builder.add_conditional_edges(
         "verify",
         route_after_verify,
         {
-            "success": END,
-            "failed": END,
+            "success": "finalize",
+            "failed": "review",
+            "inconclusive": "review",
+        },
+    )
+    builder.add_conditional_edges(
+        "review",
+        route_after_review,
+        {
+            "knowledge": "knowledge",
+            "build": "build",
+            "poc": "poc",
+            "verify": "verify",
+            "finalize": "finalize",
         },
     )
 
-    return graph.compile()
+    builder.add_edge("finalize", END)
+
+    resolved_checkpointer = checkpointer or InMemorySaver()
+    return builder.compile(checkpointer=resolved_checkpointer)

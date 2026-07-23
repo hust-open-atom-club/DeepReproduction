@@ -1,29 +1,34 @@
-"""文件说明：项目主入口。
+"""Project entrypoint for the LangGraph v1 multi-agent workflow."""
 
-这个文件只负责三件事：
-1. 从外部任务文件加载最小输入。
-2. 组装 LangGraph 所需的初始状态。
-3. 调用主流程图并返回最终结果。
+from __future__ import annotations
 
-这里不承载任何阶段实现细节，也不直接处理 Docker、Git、日志或模型调用。
-它的目标是让调用链保持单一入口，便于后续接入 CLI、批处理或服务化接口。
-"""
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
 
 import yaml
+from langgraph.types import Command
+
+
+def bootstrap_import_path() -> Path:
+    """Ensure the source directory is importable when running this file directly."""
+
+    source_root = Path(__file__).resolve().parents[1]
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    return source_root
+
+
+bootstrap_import_path()
 
 from app.orchestrator.graph import build_app_graph
 from app.schemas.task import TaskModel
 
 
 def load_task(task_path: str) -> TaskModel:
-    """加载任务文件并转换为统一任务模型。
-
-    输入：
-    - `task_path`：任务 YAML 文件路径。
-
-    输出：
-    - `TaskModel`：后续所有阶段共享的标准任务输入。
-    """
+    """Load a task YAML into the shared task schema."""
 
     with open(task_path, "r", encoding="utf-8") as file:
         task_data = yaml.safe_load(file)
@@ -31,38 +36,109 @@ def load_task(task_path: str) -> TaskModel:
     return TaskModel(**task_data)
 
 
-def build_initial_state(task: TaskModel) -> dict:
-    """基于任务对象构造主流程初始状态。
+def build_initial_state(
+    task: TaskModel,
+    dataset_root: str = "Dataset",
+    workspace_root: str = "workspaces",
+    thread_id: str | None = None,
+) -> dict:
+    """Construct the initial LangGraph state."""
 
-    初始状态只包含流程启动所需的公共信息，不提前写入阶段产物。
-    后续阶段产物由各阶段节点逐步回填。
-    """
-
+    resolved_thread_id = thread_id or task.task_id
+    workspace = str(Path(workspace_root) / task.task_id)
     return {
         "task": task,
-        "workspace": f"workspaces/{task.task_id}",
+        "run_id": task.task_id,
+        "thread_id": resolved_thread_id,
+        "dataset_root": dataset_root,
+        "workspace_root": workspace_root,
+        "workspace": workspace,
         "retry_count": {},
         "stage_history": [],
+        "stage_status": {},
+        "artifacts": {},
         "current_stage": "knowledge",
+        "review_stage": "",
+        "human_action_required": False,
+        "review_reason": "",
+        "review_payload": {},
+        "review_decision": {},
         "final_status": "running",
         "last_error": None,
     }
 
 
+def build_graph_config(thread_id: str) -> dict:
+    """Build LangGraph runtime config using a stable thread id."""
+
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def invoke_workflow(
+    task_path: str,
+    dataset_root: str = "Dataset",
+    workspace_root: str = "workspaces",
+    thread_id: str | None = None,
+    checkpointer=None,
+):
+    """Start a new workflow execution from a task file."""
+
+    task = load_task(task_path)
+    resolved_thread_id = thread_id or task.task_id
+    graph = build_app_graph(checkpointer=checkpointer)
+    initial_state = build_initial_state(
+        task=task,
+        dataset_root=dataset_root,
+        workspace_root=workspace_root,
+        thread_id=resolved_thread_id,
+    )
+    result = graph.invoke(initial_state, config=build_graph_config(resolved_thread_id))
+    return graph, result
+
+
+def resume_workflow(thread_id: str, resume_value: Any, checkpointer=None):
+    """Resume an interrupted workflow with a human review decision."""
+
+    graph = build_app_graph(checkpointer=checkpointer)
+    result = graph.invoke(Command(resume=resume_value), config=build_graph_config(thread_id))
+    return graph, result
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run or resume the DeepReproduction LangGraph workflow.")
+    parser.add_argument("--task", help="Task YAML path used to start a new workflow.")
+    parser.add_argument("--dataset-root", default="Dataset", help="Dataset root directory.")
+    parser.add_argument("--workspace-root", default="workspaces", help="Workspace root directory.")
+    parser.add_argument("--thread-id", help="Stable LangGraph thread identifier.")
+    parser.add_argument(
+        "--resume-json",
+        help="Resume an interrupted workflow with a JSON payload, for example '{\"action\": \"retry\"}'.",
+    )
+    return parser
+
+
 def main():
-    """启动漏洞复现主流程。
+    """CLI entrypoint for local workflow execution."""
 
-    当前只保留最小骨架：
-    - 加载任务
-    - 创建流程图
-    - 执行流程
-    - 输出最终状态
-    """
+    parser = _build_parser()
+    args = parser.parse_args()
 
-    task = load_task("data/tasks/demo.yaml")
-    app_graph = build_app_graph()
-    initial_state = build_initial_state(task)
-    result = app_graph.invoke(initial_state)
+    if args.resume_json:
+        if not args.thread_id:
+            parser.error("--thread-id is required when using --resume-json")
+        _, result = resume_workflow(args.thread_id, json.loads(args.resume_json))
+        print(result)
+        return
+
+    if not args.task:
+        parser.error("--task is required unless --resume-json is used")
+
+    _, result = invoke_workflow(
+        task_path=args.task,
+        dataset_root=args.dataset_root,
+        workspace_root=args.workspace_root,
+        thread_id=args.thread_id,
+    )
     print(result)
 
 
