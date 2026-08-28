@@ -127,7 +127,11 @@ def main():
         if not args.thread_id:
             parser.error("--thread-id is required when using --resume-json")
         _, result = resume_workflow(args.thread_id, json.loads(args.resume_json))
-        print(result)
+        try:
+            print(result)
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            sys.stdout.buffer.write((str(result) + "\n").encode(encoding, errors="replace"))
         return
 
     if not args.task:
@@ -139,7 +143,11 @@ def main():
         workspace_root=args.workspace_root,
         thread_id=args.thread_id,
     )
-    print(result)
+    try:
+        print(result)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        sys.stdout.buffer.write((str(result) + "\n").encode(encoding, errors="replace"))
 
 
 if __name__ == "__main__":

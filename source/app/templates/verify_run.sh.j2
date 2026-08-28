@@ -30,6 +30,18 @@ fi
 VERIFY_DIR="/workspace/artifacts/verify"
 mkdir -p "${VERIFY_DIR}"
 
+# Binaries/libs linked with -shared-libasan need the clang ASan runtime .so.
+# Scope LD_PRELOAD to the trigger subshell only — global export poisons cat/echo
+# and can hang on Docker Desktop bind mounts.
+_ASAN_RT=""
+for _asan_dir in /usr/lib/llvm-*/lib/clang/*/lib/linux /usr/lib/clang/*/lib/linux; do
+  if [[ -f "${_asan_dir}/libclang_rt.asan-x86_64.so" ]]; then
+    export LD_LIBRARY_PATH="${_asan_dir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    _ASAN_RT="${_asan_dir}/libclang_rt.asan-x86_64.so"
+    break
+  fi
+done
+
 cd "${PROJECT_DIR_VAR}" || {
     echo "execution_exit_code=255"
     echo "stdout_begin"
@@ -64,8 +76,13 @@ if [[ "${PATCH_MODE}" == "post" ]]; then
     fi
 fi
 
-# Rebuild
-{{ rebuild_command }} >/tmp/rebuild_stdout 2>/tmp/rebuild_stderr
+# Rebuild: pre uses vulnerable build.sh; post may swap dependency prefixes
+# (e.g. HDF5 1.12.0 -> 1.12.1) when gated by the build stage.
+if [[ "${PATCH_MODE}" == "post" ]]; then
+    {{ post_rebuild_command }} >/tmp/rebuild_stdout 2>/tmp/rebuild_stderr
+else
+    {{ rebuild_command }} >/tmp/rebuild_stdout 2>/tmp/rebuild_stderr
+fi
 build_rebuild_exit_code=$?
 echo "build_rebuild_exit_code=${build_rebuild_exit_code}"
 if [[ ${build_rebuild_exit_code} -ne 0 ]]; then
@@ -79,6 +96,10 @@ if [[ ${build_rebuild_exit_code} -ne 0 ]]; then
     exit 0
 fi
 
+# After rebuild: resolve in-tree shared libs (e.g. libsepol.so.2 under /src).
+{% include 'fragments/runtime_ld_path.sh.j2' %}
+{% include 'fragments/skip_redundant_asan_preload.sh.j2' %}
+
 # Trigger (PoC 同款契约)
 echo "target_binary={{ target_binary }}"
 echo "trigger_command={{ run_command }}"
@@ -86,8 +107,7 @@ echo "trigger_command={{ run_command }}"
 stdout_file="${VERIFY_DIR}/${PATCH_MODE}_stdout.txt"
 stderr_file="${VERIFY_DIR}/${PATCH_MODE}_stderr.txt"
 
-{{ run_command }} >"${stdout_file}" 2>"${stderr_file}"
-execution_exit_code=$?
+{% include 'fragments/trigger_asan_subshell.sh.j2' %}
 
 echo "execution_exit_code=${execution_exit_code}"
 echo "stdout_begin"

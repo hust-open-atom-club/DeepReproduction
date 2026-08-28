@@ -21,10 +21,20 @@ from app.schemas.knowledge import KnowledgeModel, ReproductionRecipe
 from app.schemas.task import TaskModel, TaskReference
 from app.tools.archive_tools import ArchiveTool
 from app.tools.content_cleaner import ContentCleaner
-from app.tools.patch_tools import PatchSummary, PatchTool
+from app.tools.patch_tools import PatchSummary, PatchTool, should_replace_patch_diff
+from app.tools.poc_attachments import (
+    extract_github_attachment_urls,
+    harvest_embedded_text_pocs,
+    harvest_poc_files,
+    is_github_attachment_url,
+)
+from app.tools.ossfuzz import (
+    collect_ossfuzz_issue_urls,
+    harvest_ossfuzz_testcases,
+    is_ossfuzz_issue_url,
+)
 from app.tools.reference_extractor import ReferenceExtractor
 from app.tools.web_fetch import WebFetchTool
-
 
 class ReferenceRecord(BaseModel):
     """Single reference tracked by the knowledge stage."""
@@ -136,6 +146,7 @@ class KnowledgeStage:
 
         paths = build_knowledge_paths(cve_id=cve_id, dataset_root=dataset_root)
         prepare_layout(paths)
+        curated_knowledge = self._load_curated_knowledge(paths.knowledge_yaml)
 
         try:
             task, bootstrap_error = self.bootstrap_task(cve_id=cve_id, paths=paths)
@@ -152,7 +163,13 @@ class KnowledgeStage:
                 patch_summaries,
                 selected_references,
                 skipped_references,
-            ) = self.collect_evidence(selected_references, skipped_references, paths)
+            ) = self.collect_evidence(
+                selected_references,
+                skipped_references,
+                paths,
+                fixed_ref=task.fixed_ref,
+                preferred_files=list(curated_knowledge.affected_files) if curated_knowledge else [],
+            )
             existing_pages, existing_evidence_files, existing_patch_summaries = self.load_existing_evidence(paths)
             if existing_evidence_files:
                 local_evidence_files = dedupe_preserve_order([*local_evidence_files, *existing_evidence_files])
@@ -200,6 +217,28 @@ class KnowledgeStage:
                 fetched_pages=fetched_pages,
                 patch_summaries=patch_summaries,
             )
+            attachment_recipes = self.harvest_attachment_pocs(paths=paths, fetched_pages=fetched_pages)
+            embedded_recipes = self.harvest_embedded_pocs(paths=paths, fetched_pages=fetched_pages)
+            ossfuzz_recipes = self.harvest_ossfuzz_pocs(
+                paths=paths,
+                fetched_pages=fetched_pages,
+                selected_references=source_registry.selected_references,
+            )
+            harvested_recipes = [*ossfuzz_recipes, *attachment_recipes, *embedded_recipes]
+            if harvested_recipes:
+                knowledge.reproduction_recipes = [
+                    *harvested_recipes,
+                    *knowledge.reproduction_recipes,
+                ]
+                knowledge.reproduction_hints = dedupe_preserve_order(
+                    [
+                        *[_harvest_hint_for_recipe(recipe) for recipe in harvested_recipes],
+                        *knowledge.reproduction_hints,
+                    ]
+                )
+                if not knowledge.expected_error_patterns:
+                    knowledge.expected_error_patterns = ["AddressSanitizer", "SEGV"]
+            knowledge = self._merge_curated_knowledge(knowledge, curated_knowledge)
             write_yaml(paths.knowledge_yaml, knowledge.model_dump(mode="json"))
             self.extract_and_write_poc(
                 task=task,
@@ -230,6 +269,56 @@ class KnowledgeStage:
                 ),
             )
             raise
+
+    def _load_curated_knowledge(self, knowledge_yaml: Path) -> Optional[KnowledgeModel]:
+        """Load a previously curated knowledge.yaml before the stage clears outputs."""
+
+        if not knowledge_yaml.exists():
+            return None
+        try:
+            payload = yaml.safe_load(knowledge_yaml.read_text(encoding="utf-8")) or {}
+            return KnowledgeModel(**payload)
+        except Exception:
+            return None
+
+    def _merge_curated_knowledge(
+        self,
+        knowledge: KnowledgeModel,
+        curated: Optional[KnowledgeModel],
+    ) -> KnowledgeModel:
+        """Prefer curated reproduction recipes/hints when they contain concrete artifacts."""
+
+        if curated is None:
+            return knowledge
+
+        curated_recipes = [
+            recipe
+            for recipe in curated.reproduction_recipes
+            if recipe.artifact_generation_commands or recipe.run_commands or recipe.steps
+        ]
+        if curated_recipes:
+            knowledge.reproduction_recipes = curated_recipes
+        if curated.reproduction_hints:
+            knowledge.reproduction_hints = dedupe_preserve_order(
+                [*curated.reproduction_hints, *knowledge.reproduction_hints]
+            )
+        if curated.expected_error_patterns:
+            knowledge.expected_error_patterns = dedupe_preserve_order(
+                [*curated.expected_error_patterns, *knowledge.expected_error_patterns]
+            )
+        if curated.expected_stack_keywords:
+            knowledge.expected_stack_keywords = dedupe_preserve_order(
+                [*curated.expected_stack_keywords, *knowledge.expected_stack_keywords]
+            )
+        if curated.build_commands and not knowledge.build_commands:
+            knowledge.build_commands = list(curated.build_commands)
+        if curated.build_systems and not knowledge.build_systems:
+            knowledge.build_systems = list(curated.build_systems)
+        if curated.build_files and not knowledge.build_files:
+            knowledge.build_files = list(curated.build_files)
+        if curated.build_hints:
+            knowledge.build_hints = dedupe_preserve_order([*curated.build_hints, *knowledge.build_hints])
+        return knowledge
 
     def bootstrap_task(self, cve_id: str, paths: KnowledgePaths) -> tuple[TaskModel, Optional[str]]:
         """Create or refresh a task model from local YAML and OSV metadata."""
@@ -318,12 +407,15 @@ class KnowledgeStage:
         selected_references: List[ReferenceRecord],
         skipped_references: List[ReferenceRecord],
         paths: KnowledgePaths,
+        fixed_ref: Optional[str] = None,
+        preferred_files: Optional[List[str]] = None,
     ) -> tuple[List[FetchedPage], List[str], List[PatchSummary], List[ReferenceRecord], List[ReferenceRecord]]:
         """Fetch selected references, recursively expand links, and persist evidence files."""
 
         fetched_pages: list[FetchedPage] = []
         evidence_files: list[str] = []
         patch_summaries: list[PatchSummary] = []
+        preferred_files = list(preferred_files or [])
 
         selected_by_url = {record.url: record for record in selected_references}
         skipped_by_url = {record.url: record for record in skipped_references}
@@ -360,11 +452,25 @@ class KnowledgeStage:
                 if looks_like_patch(record.url, fetched.content_type, fetched.html):
                     patch_summary = self.patches.parse_diff(fetched.html)
                     patch_summaries.append(patch_summary)
-                    if record.url.lower().endswith(".diff") and (
-                        not paths.patch_diff.exists() or not paths.patch_diff.read_text(encoding="utf-8").strip()
-                    ):
-                        paths.patch_diff.write_text(fetched.html, encoding="utf-8")
-                        evidence_files.append(str(paths.patch_diff))
+                    if record.url.lower().endswith(".diff") or record.url.lower().endswith(".patch"):
+                        existing = (
+                            paths.patch_diff.read_text(encoding="utf-8")
+                            if paths.patch_diff.exists()
+                            else ""
+                        )
+                        if should_replace_patch_diff(
+                            existing,
+                            fetched.html,
+                            candidate_url=record.url,
+                            fixed_ref=fixed_ref,
+                            preferred_files=preferred_files or patch_summary.affected_files,
+                        ):
+                            paths.patch_diff.write_text(fetched.html, encoding="utf-8")
+                            evidence_files.append(str(paths.patch_diff))
+                        else:
+                            patch_file = paths.raw_dir / f"{sanitize_filename(record.url)}.patch"
+                            patch_file.write_text(fetched.html, encoding="utf-8")
+                            evidence_files.append(str(patch_file))
                     else:
                         patch_file = paths.raw_dir / f"{sanitize_filename(record.url)}.patch"
                         patch_file.write_text(fetched.html, encoding="utf-8")
@@ -378,6 +484,26 @@ class KnowledgeStage:
                     cleaned_path = paths.cleaned_dir / f"{sanitize_filename(record.url)}.md"
                     cleaned_path.write_text(render_cleaned_markdown(fetched.url, cleaned.title, cleaned.cleaned_text), encoding="utf-8")
                     evidence_files.append(str(cleaned_path))
+
+                    attachment_urls = extract_github_attachment_urls(
+                        fetched.html or "",
+                        cleaned.cleaned_text,
+                        "\n".join(fetched.links or []),
+                    )
+                    for attachment_url in attachment_urls:
+                        if attachment_url in fetched_urls or attachment_url in selected_by_url:
+                            continue
+                        child_record = ReferenceRecord(
+                            url=attachment_url,
+                            source_type="attachment",
+                            priority="P0",
+                            depth=record.depth + 1,
+                            selected=True,
+                            note=f"GitHub issue/PR file attachment discovered from {record.url}.",
+                            reference_kind="EVIDENCE",
+                        )
+                        selected_by_url[attachment_url] = child_record
+                        queue.insert(0, child_record)
 
                     discovered_selected, discovered_skipped = self.discover_child_references(
                         parent=record,
@@ -775,6 +901,25 @@ class KnowledgeStage:
             raw = response.read().decode("utf-8", errors="replace")
         return json.loads(raw)
 
+    def _enrich_osv_with_related_advisories(self, osv_payload: dict) -> dict:
+        """Merge GIT ranges from linked OSS-Fuzz OSV advisories (e.g. OSV-2021-440)."""
+
+        related_ids = _related_osv_ids_from_payload(osv_payload)
+        if not related_ids:
+            return osv_payload
+        enriched = dict(osv_payload)
+        affected = list(enriched.get("affected") or [])
+        for related_id in related_ids:
+            try:
+                related = self._fetch_osv(related_id)
+            except Exception:
+                continue
+            for item in related.get("affected") or []:
+                if item:
+                    affected.append(item)
+        enriched["affected"] = affected
+        return enriched
+
     def _merge_osv_into_task(self, task: TaskModel, osv_payload: dict) -> TaskModel:
         references = list(task.references)
         reference_details = [TaskReference(**item.model_dump(mode="json")) for item in task.reference_details]
@@ -789,12 +934,36 @@ class KnowledgeStage:
         task_data["references"] = dedupe_preserve_order(references)
         task_data["reference_details"] = dedupe_task_references(reference_details)
 
-        repo_url = task.repo_url or infer_repo_url(osv_payload)
-        language = task.language or infer_language(osv_payload) or fetch_repo_primary_language(repo_url)
+        osv_payload = self._enrich_osv_with_related_advisories(osv_payload)
+
+        repo_url = task.repo_url or ""
+        recovering_from_metadata = bool(repo_url) and _is_metadata_repo_url(repo_url)
+        if not repo_url or recovering_from_metadata:
+            inferred_repo = infer_repo_url(osv_payload)
+            if inferred_repo:
+                repo_url = inferred_repo
+        language_seed = None if recovering_from_metadata else task.language
+        language = language_seed or infer_language(osv_payload) or fetch_repo_primary_language(repo_url)
+        # Drop stale refs that only belong to metadata mirrors (even when repo_url
+        # was already corrected to the product repository in a previous run).
+        fallback_fixed = task.fixed_ref
+        fallback_vulnerable = task.vulnerable_ref
+        stale_fixed = recovering_from_metadata or _ref_incompatible_with_repo(
+            osv_payload, fallback_fixed, repo_url
+        )
+        stale_vulnerable = recovering_from_metadata or _ref_incompatible_with_repo(
+            osv_payload, fallback_vulnerable, repo_url
+        )
+        if stale_fixed:
+            fallback_fixed = None
+            # Parent-of-metadata SHAs often are absent from OSV; drop with fixed_ref.
+            stale_vulnerable = True
+        if stale_vulnerable:
+            fallback_vulnerable = None
         vulnerable_ref, fixed_ref = infer_git_refs(
             osv_payload,
-            fallback_fixed=task.fixed_ref,
-            fallback_vulnerable=task.vulnerable_ref,
+            fallback_fixed=fallback_fixed,
+            fallback_vulnerable=fallback_vulnerable,
             repo_url=repo_url,
         )
 
@@ -804,10 +973,74 @@ class KnowledgeStage:
             task_data["language"] = language
         if vulnerable_ref:
             task_data["vulnerable_ref"] = vulnerable_ref
+        elif stale_vulnerable:
+            task_data["vulnerable_ref"] = None
         if fixed_ref:
             task_data["fixed_ref"] = fixed_ref
+        elif stale_fixed:
+            task_data["fixed_ref"] = None
 
         return TaskModel(**task_data)
+
+    def harvest_attachment_pocs(
+        self,
+        paths: KnowledgePaths,
+        fetched_pages: List[FetchedPage],
+    ) -> List[ReproductionRecipe]:
+        """Copy downloaded/extracted attachment payloads into vuln_pocs and build recipes."""
+
+        evidence_text = "\n".join(page.cleaned_text or "" for page in fetched_pages if page.cleaned_text)
+        source_url = next((page.url for page in fetched_pages if is_github_attachment_url(page.url)), "")
+        if not source_url:
+            source_url = next((page.url for page in fetched_pages if page.url), "")
+        return harvest_poc_files(
+            search_roots=[paths.extracted_dir, paths.raw_dir, paths.pocs_dir],
+            output_dir=paths.pocs_dir,
+            evidence_text=evidence_text,
+            source_url=source_url,
+            limit=4,
+        )
+
+    def harvest_embedded_pocs(
+        self,
+        paths: KnowledgePaths,
+        fetched_pages: List[FetchedPage],
+    ) -> List[ReproductionRecipe]:
+        """Harvest minimized CIL/policy PoCs embedded in commit messages or advisories."""
+
+        evidence_pages = [
+            (page.url or "", page.title or "", page.cleaned_text or "")
+            for page in fetched_pages
+            if page.cleaned_text
+        ]
+        return harvest_embedded_text_pocs(
+            output_dir=paths.pocs_dir,
+            evidence_pages=evidence_pages,
+            limit=4,
+        )
+
+    def harvest_ossfuzz_pocs(
+        self,
+        paths: KnowledgePaths,
+        fetched_pages: List[FetchedPage],
+        selected_references: Optional[List[ReferenceRecord]] = None,
+    ) -> List[ReproductionRecipe]:
+        """Download public OSS-Fuzz reproducer testcases into vuln_pocs."""
+
+        reference_urls = [record.url for record in (selected_references or []) if record.url]
+        page_texts = [
+            "\n".join(filter(None, [page.url, page.html, page.cleaned_text, "\n".join(page.links or [])]))
+            for page in fetched_pages
+        ]
+        issue_urls = collect_ossfuzz_issue_urls(reference_urls=reference_urls, page_texts=page_texts)
+        if not issue_urls:
+            return []
+        return harvest_ossfuzz_testcases(
+            output_dir=paths.pocs_dir,
+            issue_urls=issue_urls,
+            timeout=self.fetch_timeout_seconds,
+            limit=4,
+        )
 
     def extract_and_write_poc(
         self,
@@ -1023,6 +1256,15 @@ def render_cleaned_markdown(url: str, title: str, cleaned_text: str) -> str:
     return f"# {heading}\n\nSource: {url}\n\n{cleaned_text}\n"
 
 
+def _harvest_hint_for_recipe(recipe: ReproductionRecipe) -> str:
+    name = recipe.source_title or "poc"
+    if recipe.recipe_type == "ossfuzz_testcase":
+        return f"Harvested OSS-Fuzz testcase into vuln_pocs/{name}"
+    if recipe.recipe_type == "embedded_text_payload":
+        return f"Harvested embedded PoC into vuln_pocs/{name}"
+    return f"Harvested attachment PoC into vuln_pocs/{name}"
+
+
 def sanitize_filename(value: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
     sanitized = sanitized.strip("._") or "artifact"
@@ -1201,6 +1443,12 @@ def score_reference(url: str, reference_type: Optional[str] = None) -> str:
         return "P0"
 
     lowered = url.lower()
+    if is_github_attachment_url(url) or is_ossfuzz_issue_url(url):
+        return "P0"
+    if lowered.endswith((".zip", ".tar", ".tar.gz", ".tgz")) and any(
+        token in lowered for token in ("poc", "proof", "crash", "repro", "fuzz", "overflow")
+    ):
+        return "P0"
     if ".diff" in lowered or ".patch" in lowered or "/-/commit/" in lowered or "/commit/" in lowered:
         return "P0"
     if "/-/commits/" in lowered or "/commits/" in lowered:
@@ -1228,6 +1476,10 @@ def reference_type_for_url(reference_details: Iterable[TaskReference], url: str)
 
 def guess_source_type(url: str) -> str:
     lowered = url.lower()
+    if is_github_attachment_url(url):
+        return "attachment"
+    if is_ossfuzz_issue_url(url):
+        return "ossfuzz"
     if ".diff" in lowered:
         return "diff"
     if ".patch" in lowered:
@@ -1248,10 +1500,14 @@ def guess_source_type(url: str) -> str:
 def derive_reference_variants(url: str) -> List[str]:
     lowered = url.lower()
     variants: list[str] = []
-    if "github.com" in lowered and "/commit/" in lowered and not lowered.endswith(".diff"):
-        variants.append(f"{url}.diff")
-    if "/-/commit/" in lowered and not lowered.endswith(".diff") and "?" not in url:
-        variants.append(f"{url}.diff")
+    path = urlsplit(url).path
+    # GitHub and GitLab(KDE invent) commit pages → raw unified diff.
+    # Invent often uses both `/commit/<sha>` and `/-/commit/<sha>`.
+    is_commit_page = bool(re.search(r"/(?:-/)?commit/[0-9a-fA-F]{7,40}/?$", path))
+    if is_commit_page and not lowered.endswith(".diff") and "?" not in url:
+        variants.append(f"{url.rstrip('/')}.diff")
+    elif "github.com" in lowered and "/commit/" in lowered and not lowered.endswith(".diff"):
+        variants.append(f"{url.rstrip('/')}.diff")
     if "github.com" in lowered and "/blob/" in lowered:
         parts = urlsplit(url)
         path_parts = [segment for segment in parts.path.split("/") if segment]
@@ -1315,6 +1571,8 @@ def should_follow_discovered_link(parent_url: str, child_url: str) -> bool:
         return "/message/" in lowered or "cve-" in lowered
 
     if "github.com" in parent_parts.netloc.lower() and "github.com" in child_parts.netloc.lower():
+        if is_github_attachment_url(child_url):
+            return True
         parent_repo = [segment for segment in parent_parts.path.split("/") if segment][:2]
         child_repo = [segment for segment in child_parts.path.split("/") if segment][:2]
         if len(parent_repo) == 2 and parent_repo == child_repo:
@@ -1360,29 +1618,258 @@ def infer_language(osv_payload: dict) -> Optional[str]:
 
 
 def infer_repo_url(osv_payload: dict) -> Optional[str]:
-    for item in osv_payload.get("references", []):
-        url = item.get("url", "")
-        if "github.com" in url and "/commit/" in url:
-            parts = urlsplit(url)
-            path_parts = [segment for segment in parts.path.split("/") if segment]
-            if len(path_parts) >= 2:
-                return f"{parts.scheme}://{parts.netloc}/{path_parts[0]}/{path_parts[1]}.git"
-        if "/commit/" in url:
-            parts = urlsplit(url)
-            path_parts = [segment for segment in parts.path.split("/") if segment]
-            if "commit" in path_parts:
-                marker_index = path_parts.index("commit")
-                if marker_index >= 2:
-                    project_path = "/".join(path_parts[:marker_index])
-                    return f"{parts.scheme}://{parts.netloc}/{project_path}.git"
-        if "/-/commit/" in url:
-            parts = urlsplit(url)
-            path_parts = [segment for segment in parts.path.split("/") if segment]
-            if "-".strip("/") in path_parts:
-                marker_index = path_parts.index("-")
-                if marker_index >= 2:
-                    project_path = "/".join(path_parts[:marker_index])
-                    return f"{parts.scheme}://{parts.netloc}/{project_path}.git"
+    """Infer the vulnerable product repository from OSV metadata.
+
+    Prefer explicit GIT range repos, then commit URLs that are not metadata
+    mirrors (e.g. google/oss-fuzz-vulns). Package-name matches rank higher.
+    """
+
+    package_names = _osv_package_names(osv_payload)
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: Optional[str]) -> None:
+        normalized = _normalize_repo_git_url(candidate)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(normalized)
+
+    for affected in osv_payload.get("affected", []) or []:
+        for item in affected.get("ranges", []) or []:
+            if (item.get("type") or "").upper() != "GIT":
+                continue
+            _add(item.get("repo"))
+
+    for item in osv_payload.get("references", []) or []:
+        _add(_repo_url_from_commit_reference(item.get("url", "")))
+
+    if not candidates:
+        return None
+
+    preferred = [url for url in candidates if not _is_metadata_repo_url(url)]
+    pool = preferred or candidates
+
+    if package_names:
+        matched = [url for url in pool if _repo_matches_package_names(url, package_names)]
+        if matched:
+            return matched[0]
+    return pool[0]
+
+
+_METADATA_REPO_SLUGS = frozenset(
+    {
+        "google/oss-fuzz-vulns",
+        "google/oss-fuzz",
+        "github/advisory-database",
+        "pypa/advisory-database",
+        "rustsec/advisory-db",
+        "rubysec/ruby-advisory-db",
+    }
+)
+
+
+def _normalize_repo_git_url(repo_url: Optional[str]) -> Optional[str]:
+    if not repo_url:
+        return None
+    raw = str(repo_url).strip()
+    if not raw:
+        return None
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        return None
+    path = parts.path.rstrip("/")
+    if not path:
+        return None
+    if not path.endswith(".git"):
+        path = f"{path}.git"
+    return f"{parts.scheme}://{parts.netloc}{path}"
+
+
+def _related_osv_ids_from_payload(osv_payload: dict) -> list[str]:
+    """Extract linked OSV-* IDs from oss-fuzz-vulns advisory URLs."""
+
+    found: list[str] = []
+    seen: set[str] = set()
+    pattern = re.compile(r"(OSV-\d{4}-\d+)", re.IGNORECASE)
+    for item in osv_payload.get("references", []) or []:
+        url = str(item.get("url") or "")
+        if "oss-fuzz-vulns" not in url.lower():
+            continue
+        match = pattern.search(url)
+        if not match:
+            continue
+        osv_id = match.group(1).upper()
+        if osv_id in seen:
+            continue
+        seen.add(osv_id)
+        found.append(osv_id)
+    return found
+
+
+def _repo_basename(repo_url: Optional[str]) -> str:
+    if not repo_url:
+        return ""
+    path = urlsplit(repo_url).path.lower().rstrip("/").removesuffix(".git")
+    if not path:
+        return ""
+    return path.rsplit("/", 1)[-1]
+
+
+def _git_range_matches_target(
+    range_repo: Optional[str],
+    preferred_slug: str,
+    preferred_path: str,
+    package_names: list[str],
+) -> bool:
+    """True when a GIT range belongs to the chosen product repo (incl. SF mirrors)."""
+
+    range_repo = _normalize_repo_git_url(range_repo) or (range_repo or "")
+    if not range_repo or _is_metadata_repo_url(range_repo):
+        return False
+    range_slug = (extract_github_repo_slug(range_repo) or "").lower()
+    range_path = urlsplit(range_repo).path.lower().rstrip("/").removesuffix(".git")
+    if preferred_slug and range_slug and range_slug == preferred_slug:
+        return True
+    if preferred_path and range_path and range_path == preferred_path:
+        return True
+    preferred_base = preferred_path.rsplit("/", 1)[-1] if preferred_path else ""
+    range_base = _repo_basename(range_repo)
+    if not preferred_base or preferred_base != range_base:
+        return False
+    lowered_packages = {name.lower() for name in package_names}
+    return preferred_base in lowered_packages or range_base in lowered_packages
+
+
+def _is_metadata_repo_url(repo_url: str) -> bool:
+    slug = extract_github_repo_slug(repo_url)
+    if slug and slug.lower() in _METADATA_REPO_SLUGS:
+        return True
+    lowered = (repo_url or "").lower()
+    return "oss-fuzz-vulns" in lowered or "/advisory-database" in lowered
+
+
+def _repos_mentioning_commit_sha(osv_payload: dict, sha: str) -> list[str]:
+    """Return repository URLs associated with a commit SHA in OSV evidence."""
+
+    needle = (sha or "").strip().lower()
+    if len(needle) < 7:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add(repo: Optional[str]) -> None:
+        normalized = _normalize_repo_git_url(repo)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        found.append(normalized)
+
+    for item in osv_payload.get("references", []) or []:
+        url = item.get("url", "") or ""
+        if needle not in url.lower():
+            continue
+        if "/commit/" in url or "/-/commit/" in url:
+            _add(_repo_url_from_commit_reference(url))
+
+    for affected in osv_payload.get("affected", []) or []:
+        for item in affected.get("ranges", []) or []:
+            if (item.get("type") or "").upper() != "GIT":
+                continue
+            for event in item.get("events", []) or []:
+                for key in ("fixed", "introduced", "last_affected", "limit"):
+                    value = str(event.get(key) or "").strip().lower()
+                    if value and (value == needle or value.startswith(needle) or needle.startswith(value)):
+                        _add(item.get("repo"))
+                        break
+    return found
+
+
+def _ref_incompatible_with_repo(
+    osv_payload: dict,
+    sha: Optional[str],
+    repo_url: Optional[str],
+) -> bool:
+    """True when SHA is only evidenced on metadata/other repos, not the target."""
+
+    if not sha or not repo_url or _is_metadata_repo_url(repo_url):
+        return False
+    mentions = _repos_mentioning_commit_sha(osv_payload, sha)
+    if not mentions:
+        return False
+    target = _normalize_repo_git_url(repo_url)
+    target_slug = (extract_github_repo_slug(target) or "").lower()
+    for mention in mentions:
+        if target and mention == target:
+            return False
+        mention_slug = (extract_github_repo_slug(mention) or "").lower()
+        if target_slug and mention_slug == target_slug:
+            return False
+        if not _is_metadata_repo_url(mention) and target_slug and mention_slug == target_slug:
+            return False
+    # Known associations exist, but none are the product repo.
+    return True
+
+
+def _osv_package_names(osv_payload: dict) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for affected in osv_payload.get("affected", []) or []:
+        package = affected.get("package") or {}
+        for key in ("name", "purl"):
+            value = str(package.get(key) or "").strip()
+            if not value:
+                continue
+            tokens = [value.lower()]
+            if "/" in value:
+                tokens.append(value.lower().rstrip("/").rsplit("/", 1)[-1])
+            for token in tokens:
+                token = token.removeprefix("pkg:").split("@", 1)[0]
+                if token and token not in seen:
+                    seen.add(token)
+                    names.append(token)
+    return names
+
+
+def _repo_matches_package_names(repo_url: str, package_names: list[str]) -> bool:
+    slug = (extract_github_repo_slug(repo_url) or "").lower()
+    path = urlsplit(repo_url).path.lower().rstrip("/").removesuffix(".git")
+    repo_name = path.rsplit("/", 1)[-1] if path else ""
+    haystacks = {slug, path.lstrip("/"), repo_name}
+    for name in package_names:
+        if name in haystacks:
+            return True
+        if name.startswith("github.com/") and name.removeprefix("github.com/") in haystacks:
+            return True
+        if repo_name and (repo_name == name or name.endswith(f"/{repo_name}") or repo_name.endswith(name)):
+            return True
+    return False
+
+
+def _repo_url_from_commit_reference(url: str) -> Optional[str]:
+    if not url:
+        return None
+    if "github.com" in url and "/commit/" in url:
+        parts = urlsplit(url)
+        path_parts = [segment for segment in parts.path.split("/") if segment]
+        if len(path_parts) >= 2:
+            return f"{parts.scheme}://{parts.netloc}/{path_parts[0]}/{path_parts[1]}.git"
+    if "/commit/" in url:
+        parts = urlsplit(url)
+        path_parts = [segment for segment in parts.path.split("/") if segment]
+        if "commit" in path_parts:
+            marker_index = path_parts.index("commit")
+            if marker_index >= 2:
+                project_path = "/".join(path_parts[:marker_index])
+                return f"{parts.scheme}://{parts.netloc}/{project_path}.git"
+    if "/-/commit/" in url:
+        parts = urlsplit(url)
+        path_parts = [segment for segment in parts.path.split("/") if segment]
+        if "-" in path_parts:
+            marker_index = path_parts.index("-")
+            if marker_index >= 2:
+                project_path = "/".join(path_parts[:marker_index])
+                return f"{parts.scheme}://{parts.netloc}/{project_path}.git"
     return None
 
 
@@ -1392,6 +1879,10 @@ def osv_has_commit_reference(osv_payload: dict) -> bool:
         lowered = url.lower()
         if "/commit/" in lowered or "/-/commit/" in lowered:
             return True
+    for affected in osv_payload.get("affected", []) or []:
+        for item in affected.get("ranges", []) or []:
+            if (item.get("type") or "").upper() == "GIT" and (item.get("repo") or item.get("events")):
+                return True
     return False
 
 
@@ -1509,23 +2000,82 @@ def infer_git_refs(
     repo_url: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     fixed_ref = fallback_fixed
+    if fixed_ref and _ref_incompatible_with_repo(osv_payload, fixed_ref, repo_url):
+        fixed_ref = None
+    preferred_slug = (extract_github_repo_slug(repo_url) or "").lower()
+    preferred_path = ""
+    if repo_url:
+        preferred_path = urlsplit(repo_url).path.lower().rstrip("/").removesuffix(".git")
+    package_names = _osv_package_names(osv_payload)
 
-    for item in osv_payload.get("references", []):
+    commit_candidates: list[str] = []
+    for item in osv_payload.get("references", []) or []:
         url = item.get("url", "")
-        if "/-/commit/" in url or "/commit/" in url:
-            fixed_ref = fixed_ref or url.rstrip("/").split("/")[-1].replace(".patch", "")
-            break
+        if "/-/commit/" not in url and "/commit/" not in url:
+            continue
+        sha = url.rstrip("/").split("/")[-1].replace(".patch", "").replace(".diff", "")
+        if not sha:
+            continue
+        commit_repo = _repo_url_from_commit_reference(url)
+        commit_slug = (extract_github_repo_slug(commit_repo) or "").lower() if commit_repo else ""
+        commit_path = ""
+        if commit_repo:
+            commit_path = urlsplit(commit_repo).path.lower().rstrip("/").removesuffix(".git")
+        belongs_to_target = bool(
+            preferred_slug
+            and commit_slug
+            and commit_slug == preferred_slug
+        ) or bool(
+            preferred_path
+            and commit_path
+            and commit_path == preferred_path
+        )
+        # Skip metadata-repo commits when we already know the product repo.
+        if preferred_slug and _is_metadata_repo_url(commit_repo or ""):
+            continue
+        if belongs_to_target:
+            commit_candidates.insert(0, sha)
+        else:
+            commit_candidates.append(sha)
 
+    if not fixed_ref and commit_candidates:
+        fixed_ref = commit_candidates[0]
+
+    introduced_ref: Optional[str] = None
+    last_affected_ref: Optional[str] = None
     for affected in osv_payload.get("affected", []):
         for item in affected.get("ranges", []):
             if item.get("type") != "GIT":
                 continue
+            range_repo = _normalize_repo_git_url(item.get("repo")) or item.get("repo")
+            if range_repo and (preferred_slug or preferred_path):
+                if not _git_range_matches_target(
+                    range_repo, preferred_slug, preferred_path, package_names
+                ):
+                    # Keep scanning other ranges; skip metadata / unrelated repos.
+                    continue
             for event in item.get("events", []):
                 fixed = event.get("fixed")
                 if fixed:
                     fixed_ref = fixed_ref or fixed
+                introduced = event.get("introduced")
+                if introduced and introduced != "0":
+                    introduced_ref = introduced_ref or introduced
+                last_affected = event.get("last_affected")
+                if last_affected:
+                    last_affected_ref = last_affected_ref or last_affected
 
-    vulnerable_ref = fetch_github_parent_ref(repo_url, fixed_ref) or fallback_vulnerable
+    fallback_vulnerable_ok = fallback_vulnerable
+    if fallback_vulnerable_ok and _ref_incompatible_with_repo(
+        osv_payload, fallback_vulnerable_ok, repo_url
+    ):
+        fallback_vulnerable_ok = None
+    vulnerable_ref = (
+        fetch_github_parent_ref(repo_url, fixed_ref)
+        or last_affected_ref
+        or introduced_ref
+        or fallback_vulnerable_ok
+    )
     return vulnerable_ref, fixed_ref
 
 
@@ -1824,6 +2374,11 @@ _REPRO_SECTION_KEYWORDS = (
     "steps",
     "trigger",
     "base64",
+    "minimized",
+    "cil policy",
+    "minimized cil",
+    "classmap",
+    "classmapping",
 )
 
 _COMMAND_START_RE = re.compile(

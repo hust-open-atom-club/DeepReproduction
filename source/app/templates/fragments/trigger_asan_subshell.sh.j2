@@ -1,0 +1,47 @@
+{# Shared PoC/verify trigger wrapper.
+   - Always keep ASan runtime on LD_LIBRARY_PATH (set by caller).
+   - Outer LD_PRELOAD is optional: skip for library-harness / when run_command
+     already scopes LD_PRELOAD (Qt plugin harness), or when caller cleared
+     _ASAN_RT because the target already DT_NEEDs libclang_rt.asan
+     (skip_redundant_asan_preload.sh.j2 — avoids DEADLYSIGNAL recursion).
+   - When outer preload is on, never export it in this subshell: that poisons
+     unsanitized timeout/bash and recurses into DEADLYSIGNAL storms (cli-file
+     after UAF/SEGV). Start timeout/bash clean, then export LD_PRELOAD only
+     inside bash -c before eval'ing the trigger (no-op if _ASAN_RT is empty).
+   - Outer timeout bounds the whole trigger even if an inner timeout is missing.
+ #}
+{% set outer_asan_preload = outer_asan_preload if outer_asan_preload is defined else true %}
+{% set trigger_timeout_sec = trigger_timeout_sec | default(120) %}
+{% set _quoted_cmd = run_command_shell | default(run_command) %}
+(
+  # Cap trigger output files (~4MB) so a sanitizer report storm (e.g.
+  # AddressSanitizer:DEADLYSIGNAL loops) cannot fill the disk/memory. The write
+  # hits the file-size limit and the process dies with SIGXFSZ long before the
+  # outer timeout would otherwise fire.
+  ulimit -f 4096 2>/dev/null || true
+  # ASan defaults: symbolize=0 avoids AddressSanitizer:DEADLYSIGNAL storms when
+  # llvm-symbolizer is absent inside the image; abort_on_error=1 turns a report
+  # into a non-zero exit so the crash is observable. If the plan already set
+  # ASAN_OPTIONS without a symbolize= choice (e.g. "abort_on_error=1:detect_leaks=0"),
+  # append symbolize=0 so the storm cannot happen; an explicit symbolize=1
+  # (Qt library-harness) is preserved.
+  export ASAN_OPTIONS="${ASAN_OPTIONS:-abort_on_error=1:symbolize=0:detect_leaks=0}"
+  case "${ASAN_OPTIONS}" in
+    *symbolize=*) ;;
+    *) export ASAN_OPTIONS="${ASAN_OPTIONS}:symbolize=0" ;;
+  esac
+  if command -v timeout >/dev/null 2>&1; then
+{% if outer_asan_preload %}
+    timeout {{ trigger_timeout_sec }}s bash -c 'if [[ -n "$1" ]]; then export LD_PRELOAD="$1${LD_PRELOAD:+:$LD_PRELOAD}"; fi; eval "$2"' _ "${_ASAN_RT}" {{ _quoted_cmd }}
+{% else %}
+    timeout {{ trigger_timeout_sec }}s bash -c {{ _quoted_cmd }}
+{% endif %}
+  else
+{% if outer_asan_preload %}
+    bash -c 'if [[ -n "$1" ]]; then export LD_PRELOAD="$1${LD_PRELOAD:+:$LD_PRELOAD}"; fi; eval "$2"' _ "${_ASAN_RT}" {{ _quoted_cmd }}
+{% else %}
+    {{ run_command }}
+{% endif %}
+  fi
+) >"${stdout_file}" 2>"${stderr_file}"
+execution_exit_code=$?

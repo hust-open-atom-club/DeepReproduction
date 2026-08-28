@@ -1,5 +1,7 @@
 """End-to-end orchestration tests for the LangGraph v1 workflow."""
 
+from pathlib import Path
+
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
@@ -31,7 +33,7 @@ def test_build_initial_state_populates_langgraph_runtime_fields():
 
     assert state["thread_id"] == "thread-demo"
     assert state["dataset_root"] == "Dataset"
-    assert state["workspace"] == "workspaces/CVE-2022-0000"
+    assert Path(state["workspace"]) == Path("workspaces/CVE-2022-0000")
     assert state["current_stage"] == "knowledge"
     assert state["final_status"] == "running"
 

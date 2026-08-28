@@ -7,14 +7,28 @@ EXECUTION_DIR="{{ execution_dir }}"
 mkdir -p "${POC_ARTIFACTS_DIR}"
 cd "${EXECUTION_DIR}"
 
-echo "target_binary={{ target_binary }}"
-echo "trigger_command={{ run_command }}"
+# Binaries/libs linked with -shared-libasan need the clang ASan runtime .so.
+# Do not globally LD_PRELOAD here — that poisons cat/echo and can nest with
+# harness-managed LD_PRELOAD (Qt plugins → infinite DEADLYSIGNAL).
+_ASAN_RT=""
+for _asan_dir in /usr/lib/llvm-*/lib/clang/*/lib/linux /usr/lib/clang/*/lib/linux; do
+  if [[ -f "${_asan_dir}/libclang_rt.asan-x86_64.so" ]]; then
+    export LD_LIBRARY_PATH="${_asan_dir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    _ASAN_RT="${_asan_dir}/libclang_rt.asan-x86_64.so"
+    break
+  fi
+done
+
+{% include 'fragments/runtime_ld_path.sh.j2' %}
+{% include 'fragments/skip_redundant_asan_preload.sh.j2' %}
+
+echo "target_binary={{ target_binary_echo }}"
+echo "trigger_command={{ run_command_echo }}"
 
 stdout_file="${POC_ARTIFACTS_DIR}/stdout.txt"
 stderr_file="${POC_ARTIFACTS_DIR}/stderr.txt"
 
-{{ run_command }} >"${stdout_file}" 2>"${stderr_file}"
-execution_exit_code=$?
+{% include 'fragments/trigger_asan_subshell.sh.j2' %}
 
 echo "execution_exit_code=${execution_exit_code}"
 echo "stdout_begin"
