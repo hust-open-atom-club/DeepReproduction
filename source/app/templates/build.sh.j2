@@ -10,15 +10,19 @@
 - project_dir: 源码目录。默认由 src_root + project_dir_name 拼接得到。
 - cc / cxx: 编译器，默认 clang / clang++。
 - sanitizer_flags: sanitizer 相关 flags，默认 ASan。
-- cflags / cxxflags / ldflags: 完整编译和链接参数。
+- build_system: 构建系统（make / autotools / cmake / ...）。
+- cflags / cxxflags / ldflags: 完整编译和链接参数（按构建系统分流）。
 - clean_commands: 可选清理命令列表。差分验证场景下，优先清理目标二进制和中间产物，确保补丁前后可重复重编译。
 - configure_commands: 可选 configure / cmake / autoreconf 命令列表。
-- build_commands: 实际构建命令列表。待确认项，应根据源码中的 Makefile / CMakeLists.txt / configure.ac / meson.build 等证据填写，并优先保留目标仓库原生的构建变量接口（例如 MYCFLAGS / MYLDFLAGS），不要仅凭模板猜测替换成通用变量名。
+- build_commands: 实际构建命令列表。待确认项，应根据源码中的 Makefile / CMakeLists.txt / configure.ac / meson.build 等证据填写，并优先保留目标仓库原生的构建变量接口（例如 MYCFLAGS / MYLDFLAGS），不要仅凭模板猜测替换成通用变量名。cmake 项目应在此注入 CMAKE_* ASan flags。
 
 说明：
-- 模板默认围绕 C/C++ + sanitizer 编译。
+- 模板默认围绕 C/C++ + sanitizer 编译；ASan 按构建系统分流注入。
+- cmake: 不进全局 CFLAGS（避免 ExternalProject/host 工具被污染）。
+- autotools / 有 configure_commands: configure 阶段不带 ASan，build 前再 export（避免
+  shared-libasan 导致 configure 报 cannot run C compiled programs）。
+- 顺序固定为 clean → configure → (optional ASan export) → build，避免 configure 后 distclean。
 - 差分验证场景下，这个脚本需要可重复执行，既要适用于漏洞态，也要适用于补丁态。
-- 对 Lua 这类项目，可把 build_commands 改成使用 MYCFLAGS / MYLDFLAGS 的 make 调用；如果资料未明确，不要把默认流程写死成 make / cmake / ninja 中的任意一种。
 #}
 {% set src_root = src_root | default("/src") %}
 {% set workspace_root = workspace_root | default("/workspace") %}
@@ -27,14 +31,44 @@
 {% set project_name = project_name | default("target") %}
 {% set project_dir_name = project_dir_name | default(project_name) %}
 {% set project_dir = project_dir | default(src_root ~ "/" ~ project_dir_name) %}
-{% set sanitizer_flags = sanitizer_flags | default("-fsanitize=address -fno-omit-frame-pointer") %}
+{# Canonical ASan policy: always -shared-libasan (shared libs/plugins and
+   plain executables). Run templates export the clang ASan .so on LD_LIBRARY_PATH.
+
+   Injection is build-system specific:
+   - cmake: CMAKE_* flags only (no global CFLAGS/LDFLAGS ASan).
+   - autotools / non-empty configure_commands: defer ASan until after configure.
+   - plain make: export ASan via global CFLAGS/CXXFLAGS/LDFLAGS from the start. #}
+{% set build_system = build_system | default("unknown") %}
+{% set sanitizer_flags = sanitizer_flags | default("-fsanitize=address -shared-libasan -fno-omit-frame-pointer -fno-pie") %}
+{# Link-time ASan flags: same as compile flags but with -no-pie instead of -fno-pie.
+   -no-pie is a linker argument and must NOT sit in CFLAGS/CXXFLAGS (clang errors
+   "unused argument during compilation" under -Werror, e.g. fluent-bit/mbedtls). #}
+{% set sanitizer_link_flags = sanitizer_link_flags | default("-fsanitize=address -shared-libasan -fno-omit-frame-pointer -no-pie") %}
 {% set cc = cc | default("clang") %}
 {% set cxx = cxx | default("clang++") %}
-{% set cflags = cflags | default("-g -O0 " ~ sanitizer_flags) %}
-{% set cxxflags = cxxflags | default("-g -O0 " ~ sanitizer_flags) %}
-{% set ldflags = ldflags | default(sanitizer_flags) %}
-{% set clean_commands = clean_commands | default([]) %}
+{% set base_cflags = base_cflags | default("-g -O0") %}
 {% set configure_commands = configure_commands | default([]) %}
+{% set has_configure = (configure_commands | length) > 0 %}
+{% if build_system == "cmake" %}
+{% set cflags = cflags | default(base_cflags) %}
+{% set cxxflags = cxxflags | default(base_cflags) %}
+{% set ldflags = ldflags | default("") %}
+{% set asan_injection = "cmake_flags" %}
+{% set defer_asan = false %}
+{% elif build_system == "autotools" or has_configure %}
+{% set cflags = cflags | default(base_cflags) %}
+{% set cxxflags = cxxflags | default(base_cflags) %}
+{% set ldflags = ldflags | default("") %}
+{% set asan_injection = "deferred_env_cflags" %}
+{% set defer_asan = true %}
+{% else %}
+{% set cflags = cflags | default(base_cflags ~ " " ~ sanitizer_flags) %}
+{% set cxxflags = cxxflags | default(base_cflags ~ " " ~ sanitizer_flags) %}
+{% set ldflags = ldflags | default(sanitizer_link_flags) %}
+{% set asan_injection = "env_cflags" %}
+{% set defer_asan = false %}
+{% endif %}
+{% set clean_commands = clean_commands | default([]) %}
 {% set build_commands = build_commands | default([
     'echo "[build] build_commands 待确认：请根据源码中的构建入口填写 build_commands。" >&2',
     'exit 2'
@@ -88,22 +122,35 @@ fi
 log "CC=${CC}"
 log "CXX=${CXX}"
 log "SANITIZER_FLAGS=${SANITIZER_FLAGS}"
+log "build_system={{ build_system }}"
+log "asan_injection={{ asan_injection }}"
+log "CFLAGS=${CFLAGS}"
+log "CXXFLAGS=${CXXFLAGS}"
+log "LDFLAGS=${LDFLAGS}"
 
-# Optional repo-specific cleanup.
-# Examples:
-# - rm -f *.o target_binary
-# - In differential verification workflows, prefer clearing both intermediate objects and final binaries.
-# - make clean || true
+# Optional repo-specific cleanup BEFORE configure so distclean/clean cannot
+# wipe a freshly generated Makefile.
 log "running clean step"
 {% for command in clean_commands %}
 {{ command }}
 {% endfor %}
 
-# Optional configure / regenerate steps.
+# Optional configure / regenerate steps (autotools: without ASan in CFLAGS).
 log "running configure step"
 {% for command in configure_commands %}
 {{ command }}
 {% endfor %}
+
+{% if defer_asan %}
+# Apply ASan only for the real compile/link step.
+log "applying sanitizer flags for build"
+export CFLAGS="{{ base_cflags }} {{ sanitizer_flags }}"
+export CXXFLAGS="{{ base_cflags }} {{ sanitizer_flags }}"
+export LDFLAGS="{{ sanitizer_link_flags }}"
+log "CFLAGS=${CFLAGS}"
+log "CXXFLAGS=${CXXFLAGS}"
+log "LDFLAGS=${LDFLAGS}"
+{% endif %}
 
 # Main build commands.
 log "running build step"

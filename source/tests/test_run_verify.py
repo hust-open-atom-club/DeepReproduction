@@ -82,6 +82,36 @@ def test_run_verify_only_stack_keyword_hit_eligible():
     assert report.eligibility_reason.startswith("stack_keyword_hit")
 
 
+def test_run_verify_stack_keyword_ignored_when_specific_sanitizer_expected():
+    stage = poc_module.PocStage()
+    stderr = (
+        "HDF5-DIAG: Error detected in HDF5 (1.12.0) thread 0:\n"
+        "  #011: H5C.c line 6703 in H5C_load_entry(): Can't deserialize image\n"
+        "==669==WARNING: AddressSanitizer failed to allocate 0xffffffffffffffc8 bytes\n"
+    )
+    plan = poc_module.PocPlan(
+        target_binary="matio_fuzzer",
+        payload_filename="seed.bin",
+        run_command="matio_fuzzer seed.bin",
+        expected_stderr_patterns=["heap-buffer-overflow", "H5MM_memcpy"],
+        expected_stack_keywords=["H5MM_memcpy", "H5C_load_entry"],
+        expected_crash_type="heap-buffer-overflow",
+    )
+    logs = make_well_formed_logs(exit_code=0, stderr=stderr)
+    observation = make_observation(exit_code=0, stderr=stderr, crash_type="")
+
+    report = stage._build_run_verify_report(
+        plan=plan,
+        observation=observation,
+        execution_logs=logs,
+        matched_error_patterns=[],
+        matched_stack_keywords=["H5C_load_entry"],
+    )
+
+    assert report.eligible_for_verify is False
+    assert report.eligibility_reason == "no_target_behavior_observed"
+
+
 def test_run_verify_exit_code_match_only_eligible():
     stage = poc_module.PocStage()
     plan = poc_module.PocPlan(
@@ -220,7 +250,9 @@ def test_run_verify_crash_type_partial_match_eligible():
 
     assert report.crash_type_compatible is True
     assert report.eligible_for_verify is True
-    assert report.eligibility_reason.startswith("crash_type_compatible")
+    assert report.eligibility_reason.startswith(
+        ("crash_type_compatible", "specific_sanitizer_bug_in_haystack")
+    )
 
 
 # ===== Fix 1.A: stdout pattern hit produces eligible_for_verify =====

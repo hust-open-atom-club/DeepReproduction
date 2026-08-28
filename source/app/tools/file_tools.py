@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import Any
 
 
+def _normalize_newlines(content: str) -> str:
+    """Normalize all newlines to LF so Linux containers can execute scripts."""
+
+    return content.replace("\r\n", "\n").replace("\r", "\n")
+
+
 class FileTool:
     """文件系统操作实现。"""
 
@@ -27,11 +33,28 @@ class FileTool:
         Path(path).mkdir(parents=True, exist_ok=True)
 
     def write_text(self, path: str, content: str) -> None:
-        """写入文本文件。"""
+        """写入文本文件（强制 LF，避免 Windows CRLF 破坏容器内 shell 脚本）。"""
 
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        with target.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(_normalize_newlines(content))
+
+    def write_bytes(self, path: str, content: bytes) -> None:
+        """写入原始字节（用于含控制字符/非 UTF-8 的 PoC payload）。"""
+
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+    def write_latin1(self, path: str, content: str) -> None:
+        """按 latin-1 落盘，保留 0x00-0xFF 单字节语义（含 ``\\r``）。
+
+        PoC/fuzz 种子可能依赖精确字节（例如 HDF5 魔数 ``\\x89HDF\\r\\n\\x1a\\n``）。
+        换行归一只用于 ``write_text`` 的脚本/配置，不要在这里做。
+        """
+
+        self.write_bytes(path, content.encode("latin-1"))
 
     def read_text(self, path: str) -> str:
         """读取文本文件。"""
@@ -41,9 +64,7 @@ class FileTool:
     def write_json(self, path: str, payload: Any) -> None:
         """写入 JSON 文件。"""
 
-        target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.write_text(path, json.dumps(payload, indent=2, ensure_ascii=False))
 
     def exists(self, path: str) -> bool:
         """判断路径是否存在。"""

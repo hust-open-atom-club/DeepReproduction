@@ -37,6 +37,40 @@ def make_build(**overrides):
     return BuildArtifact(**payload)
 
 
+def test_apply_vulnerable_hdf5_policy_when_build_script_has_marker():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="matio_fuzzer",
+        expected_stderr_patterns=["AddressSanitizer"],
+        expected_stack_keywords=["AddressSanitizer"],
+        expected_crash_type="",
+        environment_variables={},
+    )
+    build = make_build(
+        build_script_content="#!/bin/bash\necho deeprepro:vulnerable-hdf5-1.12.0\n"
+    )
+    updated = stage._apply_vulnerable_hdf5_cve_match_policy_if_gated(plan, build)
+    assert updated.expected_stderr_patterns == ["heap-buffer-overflow", "H5MM_memcpy"]
+    assert "AddressSanitizer" not in updated.expected_stderr_patterns
+    assert "H5MM_memcpy" in updated.expected_stack_keywords
+    assert "H5C_load_entry" not in updated.expected_stack_keywords
+    assert updated.expected_crash_type == "heap-buffer-overflow"
+    assert "allocator_may_return_null=1" in updated.environment_variables["ASAN_OPTIONS"]
+
+
+def test_apply_vulnerable_hdf5_policy_noop_without_marker():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="demo",
+        expected_stderr_patterns=["AddressSanitizer"],
+        environment_variables={},
+    )
+    build = make_build()
+    updated = stage._apply_vulnerable_hdf5_cve_match_policy_if_gated(plan, build)
+    assert updated.expected_stderr_patterns == ["AddressSanitizer"]
+    assert "ASAN_OPTIONS" not in updated.environment_variables
+
+
 def test_collect_poc_context_uses_build_artifact_and_hints(tmp_path, monkeypatch):
     stage = poc_module.PocStage()
     workspace = tmp_path / "ws"
@@ -117,7 +151,6 @@ def test_plan_poc_prefers_llm_plan_when_available(monkeypatch):
     build = make_build()
     context = poc_module.PocContext(
         cve_id=knowledge.cve_id,
-        reference_poc_summaries=["SUMMARY: dataset poc"],
     )
 
     plan = stage.plan_poc(knowledge=knowledge, build=build, context=context)
@@ -126,6 +159,67 @@ def test_plan_poc_prefers_llm_plan_when_available(monkeypatch):
     assert plan.payload_filename == "llm.txt"
     assert context.chosen_strategy == "llm_synthesized"
     assert fake_model.calls == 2
+
+
+def test_plan_poc_forces_dataset_strategy_when_dataset_payload_exists(monkeypatch):
+    class FakeModel:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            raise AssertionError("LLM must not be called when authoritative dataset bytes exist")
+
+    import base64
+
+    fake_model = FakeModel()
+    monkeypatch.setattr(poc_module, "build_chat_model", lambda *args, **kwargs: fake_model)
+    stage = poc_module.PocStage()
+    knowledge = make_knowledge(
+        expected_error_patterns=["AddressSanitizer"],
+        vulnerability_type="heap-based buffer over-read",
+    )
+    build = make_build(binary_or_entrypoint="secilc/secilc")
+    payload = b"(class file)\n(classmap file file)\n"
+    context = poc_module.PocContext(
+        cve_id=knowledge.cve_id,
+        repo_url=knowledge.repo_url or "",
+        dataset_poc_filenames=["poc.cil"],
+        dataset_poc_base64_blobs=[base64.b64encode(payload).decode("ascii")],
+        reference_poc_summaries=["FILE: poc.cil\nENCODING: text\nCONTENT:\n(class file)"],
+    )
+
+    plan = stage.plan_poc(knowledge=knowledge, build=build, context=context)
+
+    assert context.chosen_strategy == "dataset_poc"
+    assert plan.payload_filename == "poc.cil"
+    assert plan.payload_content == payload.decode("latin-1")
+    assert plan.source_of_truth == "dataset_poc"
+    assert "secilc" in plan.target_binary
+    assert plan.payload_filename in " ".join(plan.target_args + [plan.run_command])
+    assert fake_model.calls == 0
+
+
+def test_summarize_reproduction_recipes_omits_large_base64_blobs():
+    stage = poc_module.PocStage()
+    huge = "A" * 5000
+    recipes = [
+        ReproductionRecipe(
+            source_url="https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=1",
+            source_title="clusterfuzz-testcase.cil",
+            recipe_type="ossfuzz_testcase",
+            steps=[f"printf '%s' '{huge}' | base64 -d > poc.cil"],
+            artifact_generation_commands=[f"printf '%s' '{huge}' | base64 -d > poc.cil"],
+            source_excerpt="Harvested OSS-Fuzz testcase",
+            confidence="high",
+        )
+    ]
+
+    summaries = stage._summarize_reproduction_recipes(recipes)
+
+    assert len(summaries) == 1
+    assert huge not in summaries[0]
+    assert "large base64 payload omitted" in summaries[0]
 
 
 def test_plan_poc_reuses_selected_strategy_without_reselecting(monkeypatch):
@@ -167,7 +261,46 @@ def test_plan_poc_reuses_selected_strategy_without_reselecting(monkeypatch):
     stage.plan_poc(knowledge=knowledge, build=build, context=context)
 
     assert context.chosen_strategy == "dataset_poc"
-    assert fake_model.calls == 3
+    # Authoritative dataset evidence skips the strategy selector on the first turn.
+    assert fake_model.calls == 2
+
+
+def test_classify_failure_kind_detects_payload_invalid():
+    stage = poc_module.PocStage()
+    logs = (
+        "container_run_success=True\n"
+        "stderr_begin\n"
+        "Invalid syntax\n"
+        "Bad classpermission declaration at /workspace/artifacts/poc/payloads/poc.cil:5\n"
+        "Failed to compile cildb: -1\n"
+        "stderr_end\n"
+        "execution_exit_code=255\n"
+    )
+    assert stage._classify_failure_kind(logs) == "payload_invalid"
+
+
+def test_poc_replan_gate_requires_payload_change_for_payload_invalid():
+    stage = poc_module.PocStage()
+    previous_plan = poc_module.PocPlan(
+        target_binary="secilc",
+        payload_filename="poc.cil",
+        payload_content="(bad)\n",
+        run_command="secilc poc.cil",
+    )
+    same_payload = poc_module.PocPlan(
+        target_binary="secilc",
+        payload_filename="poc.cil",
+        payload_content="(bad)\n",
+        run_command="secilc -v poc.cil",
+    )
+    changed_payload = poc_module.PocPlan(
+        target_binary="secilc",
+        payload_filename="poc.cil",
+        payload_content="(class file)\n",
+        run_command="secilc poc.cil",
+    )
+    assert stage._is_valid_replan_candidate(previous_plan, same_payload, failure_kind="payload_invalid") is False
+    assert stage._is_valid_replan_candidate(previous_plan, changed_payload, failure_kind="payload_invalid") is True
 
 
 def test_llm_prompt_includes_previous_run_artifacts():
@@ -599,6 +732,80 @@ def test_select_target_binary_prefers_build_image_project_dir_when_repo_url_know
     assert target_binary == "/src/lua/lua"
 
 
+def test_select_target_binary_prefers_ossfuzz_harness_with_evidence(tmp_path):
+    stage = poc_module.PocStage()
+    repo = tmp_path / "fluent-bit"
+    fuzz_dir = repo / "tests" / "internal" / "fuzzers"
+    fuzz_dir.mkdir(parents=True)
+    (repo / "CMakeLists.txt").write_text("project(fluent-bit)\n", encoding="utf-8")
+    (fuzz_dir / "parser_fuzzer.c").write_text("int LLVMFuzzerTestOneInput(){return 0;}\n", encoding="utf-8")
+    (fuzz_dir / "CMakeLists.txt").write_text("parser_fuzzer.c\n", encoding="utf-8")
+
+    build = make_build(
+        binary_or_entrypoint="build/bin/fluent-bit",
+        expected_binary_path="build/bin/fluent-bit",
+        repo_local_path=str(repo),
+    )
+    context = poc_module.PocContext(
+        cve_id="CVE-2021-36088",
+        repo_url="https://github.com/fluent/fluent-bit.git",
+    )
+    payload = "clusterfuzz-testcase-minimized-flb-it-fuzz-parser_fuzzer_OSSFUZZ-5216297967288320.fuzz"
+
+    target_binary = stage._select_target_binary(build, context, payload)
+
+    assert target_binary == "/src/fluent-bit/build/bin/flb-it-fuzz-parser_fuzzer"
+
+
+def test_select_target_binary_keeps_secilc_without_harness_evidence(tmp_path):
+    stage = poc_module.PocStage()
+    repo = tmp_path / "selinux"
+    (repo / "secilc").mkdir(parents=True)
+    (repo / "secilc" / "secilc").write_text("", encoding="utf-8")
+
+    build = make_build(
+        binary_or_entrypoint="secilc/secilc",
+        expected_binary_path="secilc/secilc",
+        repo_local_path=str(repo),
+    )
+    context = poc_module.PocContext(
+        cve_id="CVE-2021-36086",
+        repo_url="https://github.com/SELinuxProject/selinux.git",
+    )
+    payload = "clusterfuzz-testcase-minimized-secilc-fuzzer-5563841674084352.cil"
+
+    target_binary = stage._select_target_binary(build, context, payload)
+
+    assert target_binary == "/src/selinux/secilc/secilc"
+
+
+def test_select_target_binary_prefers_standalone_ossfuzz_cpp(tmp_path):
+    stage = poc_module.PocStage()
+    repo = tmp_path / "matio"
+    ossfuzz_dir = repo / "ossfuzz"
+    ossfuzz_dir.mkdir(parents=True)
+    (ossfuzz_dir / "matio_fuzzer.cpp").write_text(
+        'extern "C" int LLVMFuzzerTestOneInput(){return 0;}\n',
+        encoding="utf-8",
+    )
+
+    build = make_build(
+        binary_or_entrypoint="",
+        expected_binary_path=None,
+        repo_local_path=str(repo),
+    )
+    context = poc_module.PocContext(
+        cve_id="CVE-2021-36977",
+        repo_url="https://github.com/tbeu/matio.git",
+    )
+    payload = "clusterfuzz-testcase-minimized-matio_fuzzer-4806922097262592"
+
+    target_binary = stage._select_target_binary(build, context, payload)
+
+    assert target_binary == "/src/matio/matio_fuzzer"
+    assert not target_binary.endswith("/target")
+
+
 def test_normalize_run_command_rewrites_workspace_repo_binary_path():
     stage = poc_module.PocStage()
 
@@ -609,6 +816,551 @@ def test_normalize_run_command_rewrites_workspace_repo_binary_path():
     )
 
     assert command == "/src/lua/lua /workspace/artifacts/poc/payloads/poc.lua"
+
+
+def test_normalize_poc_plan_strips_pre_run_make_rebuild():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="/src/selinux/secilc/secilc",
+        payload_filename="poc.cil",
+        payload_content="(class CLASS (PERM))\n",
+        run_command=(
+            "cd /src/selinux && make -C secilc && "
+            "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 "
+            "./secilc/secilc /workspace/artifacts/poc/payloads/poc.cil"
+        ),
+    )
+
+    normalized = stage._normalize_poc_plan(
+        plan,
+        repo_url="https://github.com/SELinuxProject/selinux.git",
+    )
+
+    assert "make" not in normalized.run_command
+    assert normalized.run_command == (
+        "cd /src/selinux && "
+        "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 "
+        "./secilc/secilc /workspace/artifacts/poc/payloads/poc.cil"
+    )
+
+
+def test_normalize_poc_plan_rewrites_qt_plugin_so_into_qimage_harness():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="/src/kimageformats/build/src/imageformats/kimg_xcf.so",
+        payload_filename="crafted.xcf",
+        payload_content="xcf-bytes\n",
+        run_command=(
+            "cd /src/kimageformats && QT_DEBUG_PLUGINS=1 "
+            "build/src/imageformats/kimg_xcf.so /workspace/artifacts/poc/payloads/crafted.xcf"
+        ),
+        expected_stderr_patterns=["Stack-buffer-overflow WRITE"],
+    )
+
+    normalized = stage._normalize_poc_plan(
+        plan,
+        repo_url="https://invent.kde.org/frameworks/kimageformats.git",
+    )
+
+    assert normalized.target_binary == "/src/kimageformats/build/bin/imageformats/kimg_xcf.so"
+    assert normalized.trigger_mode == "library-harness"
+    assert "inputs/qimage_harness.cpp" in normalized.auxiliary_files
+    assert "QImageReader" in normalized.auxiliary_files["inputs/qimage_harness.cpp"]
+    assert "qimage_harness" in normalized.run_command
+    assert "QT_PLUGIN_PATH='/src/kimageformats/build/bin'" in normalized.run_command
+    assert "libclang_rt.asan-x86_64.so" in normalized.run_command
+    assert "LD_LIBRARY_PATH" in normalized.run_command
+    assert "ASAN_OPTIONS=" in normalized.run_command
+    # Loader is unsanitized; ASan comes from LD_PRELOAD + the instrumented plugin.
+    assert "-fsanitize=address" not in normalized.run_command
+    assert "-shared-libasan" not in normalized.run_command
+    assert "timeout 90s env LD_PRELOAD=" in normalized.run_command
+    assert "export LD_PRELOAD" not in normalized.run_command
+    assert normalized.run_command.index("clang++") < normalized.run_command.index("timeout 90s env LD_PRELOAD=")
+    assert "abort_on_error=1" in normalized.run_command
+    assert "halt_on_error=1" in normalized.run_command
+    assert "alloc_dealloc_mismatch=0" in normalized.run_command
+    assert "symbolize=1" in normalized.run_command
+    assert "fast_unwind_on_fatal=0" in normalized.run_command
+    assert "handle_segv" not in normalized.run_command
+    assert "timeout 90s" in normalized.run_command
+    assert "kimg_xcf.so /workspace" not in normalized.run_command
+    assert normalized.environment_variables.get("QT_PLUGIN_PATH") == "/src/kimageformats/build/bin"
+    assert "abort_on_error=1" in normalized.environment_variables.get("ASAN_OPTIONS", "")
+    assert "alloc_dealloc_mismatch=0" in normalized.environment_variables.get("ASAN_OPTIONS", "")
+    assert "symbolize=1" in normalized.environment_variables.get("ASAN_OPTIONS", "")
+    assert "handle_segv" not in normalized.environment_variables.get("ASAN_OPTIONS", "")
+
+
+def test_discover_candidate_binaries_skips_docs_and_finds_kimg_plugin(tmp_path):
+    stage = poc_module.PocStage()
+    repo = tmp_path / "kimageformats"
+    src = repo / "src" / "imageformats"
+    plugin_dir = repo / "build" / "bin" / "imageformats"
+    src.mkdir(parents=True)
+    plugin_dir.mkdir(parents=True)
+    (src / "AUTHORS").write_text("names\n", encoding="utf-8")
+    (src / "xcf.cpp").write_text("int x;\n", encoding="utf-8")
+    (plugin_dir / "kimg_xcf.so").write_bytes(b"\x7fELF")
+
+    found = stage._discover_candidate_binaries(repo)
+    assert "src/imageformats/AUTHORS" not in found
+    assert any(Path(item).name == "kimg_xcf.so" for item in found)
+
+
+def test_normalize_poc_plan_rewrites_authors_doc_to_kimg_plugin():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="/src/kimageformats/src/imageformats/AUTHORS",
+        payload_filename="crafted_bpp5.xcf",
+        payload_content="xcf-bytes\n",
+        run_command=(
+            "'/src/kimageformats/src/imageformats/AUTHORS' "
+            "'/workspace/artifacts/poc/payloads/crafted_bpp5.xcf'"
+        ),
+        expected_stderr_patterns=["stack-buffer-overflow"],
+    )
+
+    normalized = stage._normalize_poc_plan(
+        plan,
+        repo_url="https://invent.kde.org/frameworks/kimageformats.git",
+    )
+
+    assert normalized.target_binary == "/src/kimageformats/build/bin/imageformats/kimg_xcf.so"
+    assert normalized.trigger_mode == "library-harness"
+    assert "qimage_harness" in normalized.run_command
+    assert "AUTHORS" not in normalized.run_command
+
+
+def test_select_target_binary_skips_authors_for_xcf_payload():
+    stage = poc_module.PocStage()
+    build = make_build(binary_or_entrypoint="", expected_binary_path=None)
+    context = poc_module.PocContext(
+        cve_id="CVE-2021-36083",
+        repo_url="https://invent.kde.org/frameworks/kimageformats.git",
+        candidate_entrypoints=["src/imageformats/AUTHORS", "src/imageformats/xcf.cpp"],
+    )
+    target = stage._select_target_binary(build, context, "crafted_bpp5.xcf")
+    assert target == "/src/kimageformats/build/bin/imageformats/kimg_xcf.so"
+    stage = poc_module.PocStage()
+    assert (
+        stage._correct_qt_plugin_binary_path("/src/kimageformats/build/bin/kimg_xcf.so")
+        == "/src/kimageformats/build/bin/imageformats/kimg_xcf.so"
+    )
+    already = "/src/kimageformats/build/bin/imageformats/kimg_xcf.so"
+    assert stage._correct_qt_plugin_binary_path(already) == already
+
+
+def test_normalize_poc_plan_rewrites_bare_build_bin_kimg_into_harness():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="/src/kimageformats/build/bin/kimg_xcf.so",
+        payload_filename="crafted_bpp5.xcf",
+        payload_content="xcf-bytes\n",
+        run_command=(
+            "cd /src/kimageformats && "
+            "/src/kimageformats/build/bin/kimg_xcf.so "
+            "/workspace/artifacts/poc/payloads/crafted_bpp5.xcf"
+        ),
+        expected_stderr_patterns=["Stack-buffer-overflow WRITE"],
+    )
+
+    normalized = stage._normalize_poc_plan(
+        plan,
+        repo_url="https://invent.kde.org/frameworks/kimageformats.git",
+    )
+
+    assert normalized.target_binary == "/src/kimageformats/build/bin/imageformats/kimg_xcf.so"
+    assert "QT_PLUGIN_PATH='/src/kimageformats/build/bin'" in normalized.run_command
+    assert "qimage_harness" in normalized.run_command
+
+
+def test_order_dataset_poc_payloads_prefers_crafted_bpp_xcf():
+    import base64
+
+    stage = poc_module.PocStage()
+    names = [
+        "clusterfuzz-testcase-minimized-xcf_fuzzer-1234567890.xcf",
+        "crafted_bpp5.xcf",
+        "notes.xcf",
+    ]
+    blobs = [
+        base64.b64encode(b"A" * 200).decode("ascii"),
+        base64.b64encode(b"bpp5").decode("ascii"),
+        base64.b64encode(b"note").decode("ascii"),
+    ]
+    ordered_names, _ = stage._order_dataset_poc_payloads(names, blobs)
+    assert ordered_names[0] == "crafted_bpp5.xcf"
+    assert ordered_names[-1].startswith("clusterfuzz")
+
+
+def test_order_dataset_poc_payloads_prefers_ossfuzz_over_tiny_poc_cil():
+    import base64
+
+    stage = poc_module.PocStage()
+    names = [
+        "poc.cil",
+        "clusterfuzz-testcase-minimized-secilc-fuzzer-5563841674084352.cil",
+    ]
+    blobs = [
+        base64.b64encode(b"(blockinherit b3)\n").decode("ascii"),
+        base64.b64encode(b"ossfuzz-seed" * 40).decode("ascii"),
+    ]
+    ordered_names, _ = stage._order_dataset_poc_payloads(names, blobs)
+    assert ordered_names[0].startswith("clusterfuzz")
+    assert ordered_names[-1] == "poc.cil"
+
+
+def test_prefer_ossfuzz_minimized_payload_switches_from_generic_poc_cil():
+    import base64
+
+    stage = poc_module.PocStage()
+    ossfuzz = b"clusterfuzz-minimized-seed"
+    plan = poc_module.PocPlan(
+        target_binary="/src/selinux/secilc/secilc",
+        target_args=["/workspace/artifacts/poc/payloads/poc.cil"],
+        payload_filename="poc.cil",
+        payload_content="(blockinherit b3)\n",
+        run_command="'/src/selinux/secilc/secilc' '/workspace/artifacts/poc/payloads/poc.cil'",
+        source_of_truth="dataset_poc",
+    )
+    updated = stage._prefer_ossfuzz_minimized_payload(
+        plan,
+        dataset_poc_filenames=[
+            "poc.cil",
+            "clusterfuzz-testcase-minimized-secilc-fuzzer-5563841674084352.cil",
+        ],
+        dataset_poc_base64_blobs=[
+            base64.b64encode(b"(blockinherit b3)\n").decode("ascii"),
+            base64.b64encode(ossfuzz).decode("ascii"),
+        ],
+    )
+    updated = stage._sync_payload_filename_into_command(updated)
+    assert updated.payload_filename.startswith("clusterfuzz")
+    assert updated.payload_content == ossfuzz.decode("latin-1")
+    assert updated.target_args == [
+        "/workspace/artifacts/poc/payloads/clusterfuzz-testcase-minimized-secilc-fuzzer-5563841674084352.cil"
+    ]
+    assert "clusterfuzz-testcase-minimized-secilc-fuzzer-5563841674084352.cil" in updated.run_command
+    assert "poc.cil" not in updated.run_command
+
+
+def test_prefer_ossfuzz_minimized_payload_does_not_override_crafted_bpp():
+    import base64
+
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="/src/kimageformats/build/bin/imageformats/kimg_xcf.so",
+        payload_filename="crafted_bpp5.xcf",
+        payload_content="small-xcf",
+        source_of_truth="dataset_poc",
+    )
+    updated = stage._prefer_ossfuzz_minimized_payload(
+        plan,
+        dataset_poc_filenames=[
+            "crafted_bpp5.xcf",
+            "clusterfuzz-testcase-minimized-xcf_fuzzer-999.xcf",
+        ],
+        dataset_poc_base64_blobs=[
+            base64.b64encode(b"small-xcf").decode("ascii"),
+            base64.b64encode(b"Y" * 5000).decode("ascii"),
+        ],
+    )
+    assert updated.payload_filename == "crafted_bpp5.xcf"
+    assert updated.payload_content == "small-xcf"
+
+
+def test_prefer_compact_dataset_xcf_payload_switches_from_clusterfuzz():
+    import base64
+
+    stage = poc_module.PocStage()
+    crafted = b"small-xcf-payload"
+    plan = poc_module.PocPlan(
+        target_binary="/src/kimageformats/build/bin/imageformats/kimg_xcf.so",
+        payload_filename="clusterfuzz-testcase-minimized-xcf_fuzzer-999.xcf",
+        payload_content="X" * 5000,
+        source_of_truth="llm_synthesized",
+    )
+    updated = stage._prefer_compact_dataset_xcf_payload(
+        plan,
+        dataset_poc_filenames=[
+            "clusterfuzz-testcase-minimized-xcf_fuzzer-999.xcf",
+            "crafted_bpp5.xcf",
+        ],
+        dataset_poc_base64_blobs=[
+            base64.b64encode(b"Y" * 5000).decode("ascii"),
+            base64.b64encode(crafted).decode("ascii"),
+        ],
+    )
+    assert updated.payload_filename == "crafted_bpp5.xcf"
+    assert updated.payload_content == crafted.decode("latin-1")
+    assert updated.source_of_truth == "dataset_poc"
+
+
+def test_normalize_poc_plan_drops_generic_asan_when_specific_bug_present():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="/src/kimageformats/build/bin/imageformats/kimg_xcf.so",
+        payload_filename="crafted_bpp5.xcf",
+        payload_content="xcf\n",
+        expected_stderr_patterns=[
+            "AddressSanitizer",
+            "stack-buffer-overflow",
+            "AddressSanitizer: stack-buffer-overflow",
+        ],
+        expected_stack_keywords=["AddressSanitizer", "loadHierarchy"],
+        expected_crash_type="heap-buffer-overflow",
+    )
+
+    normalized = stage._normalize_poc_plan(
+        plan,
+        repo_url="https://invent.kde.org/frameworks/kimageformats.git",
+    )
+
+    assert "AddressSanitizer" not in normalized.expected_stderr_patterns
+    assert "stack-buffer-overflow" in normalized.expected_stderr_patterns
+    assert "AddressSanitizer: stack-buffer-overflow" in normalized.expected_stderr_patterns
+    assert "AddressSanitizer" not in normalized.expected_stack_keywords
+    assert "loadHierarchy" in normalized.expected_stack_keywords
+    assert "alloc_dealloc_mismatch=0" in normalized.environment_variables.get("ASAN_OPTIONS", "")
+
+
+def test_normalize_poc_plan_keeps_overflow_token_and_drops_segv():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="/src/selinux/secilc/secilc",
+        payload_filename="clusterfuzz-testcase-minimized-secilc-fuzzer-1.cil",
+        payload_content="seed\n",
+        expected_stderr_patterns=["SEGV", "null dereference", "heap-based buffer over-read"],
+        expected_crash_type="heap-buffer-overflow",
+    )
+
+    normalized = stage._normalize_poc_plan(
+        plan,
+        repo_url="https://github.com/SELinuxProject/selinux.git",
+    )
+
+    assert "heap-buffer-overflow" in normalized.expected_stderr_patterns
+    assert "SEGV" not in normalized.expected_stderr_patterns
+    assert "null dereference" not in normalized.expected_stderr_patterns
+
+
+def test_extract_execution_observation_prefers_asan_overflow_over_aborting():
+    stage = poc_module.PocStage()
+    logs = (
+        "execution_exit_code=1\n"
+        "stdout_begin\n"
+        "stdout_end\n"
+        "stderr_begin\n"
+        "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n"
+        "==41==ABORTING\n"
+        "stderr_end\n"
+    )
+
+    parsed = stage._extract_execution_observation(logs)
+
+    assert parsed["observed_crash_type"] == "heap-buffer-overflow"
+
+
+def test_build_run_verify_report_eligible_when_overflow_in_haystack_not_patterns():
+    stage = poc_module.PocStage()
+    stderr = (
+        "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n"
+        "==41==ABORTING\n"
+    )
+    plan = poc_module.PocPlan(
+        expected_stderr_patterns=["SEGV", "null dereference"],
+        expected_crash_type="heap-buffer-overflow",
+        expected_exit_code=None,
+    )
+    observation = {
+        "observed_exit_code": 1,
+        "observed_stdout": "",
+        "observed_stderr": stderr,
+        "observed_crash_type": "heap-buffer-overflow",
+    }
+    logs = (
+        "execution_exit_code=1\nstdout_begin\nstdout_end\nstderr_begin\n"
+        f"{stderr}stderr_end\n"
+    )
+    report = stage._build_run_verify_report(
+        plan=plan,
+        observation=observation,
+        execution_logs=logs,
+        matched_error_patterns=[],
+        matched_stack_keywords=[],
+    )
+    assert report.eligible_for_verify is True
+    assert report.crash_type_compatible is True
+    assert report.eligibility_reason in {
+        "specific_sanitizer_bug_in_haystack",
+        "crash_type_compatible: observed=heap-buffer-overflow",
+    }
+
+
+def test_build_run_verify_report_ignores_generic_asan_when_specific_expected():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        expected_stderr_patterns=["AddressSanitizer", "stack-buffer-overflow"],
+        expected_crash_type="stack-buffer-overflow",
+        expected_exit_code=None,
+    )
+    observation = {
+        "observed_exit_code": 1,
+        "observed_stdout": "",
+        "observed_stderr": "AddressSanitizer: alloc-dealloc-mismatch (operator new [] vs operator delete)",
+        "observed_crash_type": "abort",
+    }
+    logs = (
+        "execution_exit_code=1\nstdout_begin\nstdout_end\nstderr_begin\n"
+        "AddressSanitizer: alloc-dealloc-mismatch\nstderr_end\n"
+    )
+    report = stage._build_run_verify_report(
+        plan=plan,
+        observation=observation,
+        execution_logs=logs,
+        matched_error_patterns=["AddressSanitizer"],
+        matched_stack_keywords=[],
+    )
+    assert report.error_pattern_hits == ["AddressSanitizer"]
+    assert report.eligible_for_verify is False
+    assert report.eligibility_reason == "no_target_behavior_observed"
+
+
+def test_poc_run_template_skips_outer_preload_when_run_command_scopes_asan():
+    stage = poc_module.PocStage()
+    with_inner = stage._render_template(
+        "poc_run.sh.j2",
+        {
+            "poc_artifacts_dir": "/workspace/artifacts/poc",
+            "execution_dir": "/src/proj",
+            "target_binary": "/src/proj/plugin.so",
+            "target_binary_echo": "/src/proj/plugin.so",
+            "run_command": "export LD_PRELOAD=/usr/lib/libasan.so; /tmp/harness",
+            "run_command_echo": "export LD_PRELOAD=...; /tmp/harness",
+            "run_command_shell": "'export LD_PRELOAD=/usr/lib/libasan.so; /tmp/harness'",
+            "outer_asan_preload": False,
+            "trigger_timeout_sec": 120,
+        },
+    )
+    assert "timeout 120s bash -c" in with_inner
+    # Outer subshell must not export LD_PRELOAD again before bash -c.
+    trigger_block = with_inner.split("stderr_file=")[-1]
+    assert 'export LD_PRELOAD="${_ASAN_RT}' not in trigger_block
+    assert 'export LD_PRELOAD="$1' not in trigger_block
+
+    without_inner = stage._render_template(
+        "poc_run.sh.j2",
+        {
+            "poc_artifacts_dir": "/workspace/artifacts/poc",
+            "execution_dir": "/src/proj",
+            "target_binary": "/src/proj/bin",
+            "target_binary_echo": "/src/proj/bin",
+            "run_command": "/src/proj/bin payload",
+            "run_command_echo": "/src/proj/bin payload",
+            "run_command_shell": "'/src/proj/bin payload'",
+            "outer_asan_preload": True,
+            "trigger_timeout_sec": 120,
+        },
+    )
+    assert "timeout 120s bash -c" in without_inner
+    assert 'export LD_PRELOAD="$1' in without_inner
+    assert without_inner.index("timeout 120s bash -c") < without_inner.index(
+        'export LD_PRELOAD="$1'
+    )
+    assert '"${_ASAN_RT}"' in without_inner.split("stderr_file=")[-1]
+    trigger = without_inner.split("stderr_file=")[-1]
+    assert "export LD_PRELOAD=" not in trigger.split("timeout", 1)[0]
+
+
+def test_poc_run_template_clears_asan_rt_when_target_already_links_asan():
+    """Gate: DT_NEEDED libclang_rt.asan → skip redundant outer LD_PRELOAD."""
+    stage = poc_module.PocStage()
+    rendered = stage._render_template(
+        "poc_run.sh.j2",
+        {
+            "poc_artifacts_dir": "/workspace/artifacts/poc",
+            "execution_dir": "/src/lua",
+            "target_binary": "/src/lua/src/lua",
+            "target_binary_echo": "/src/lua/src/lua",
+            "run_command": "/src/lua/src/lua /workspace/artifacts/poc/payloads/poc.lua",
+            "run_command_echo": "/src/lua/src/lua poc.lua",
+            "run_command_shell": "'/src/lua/src/lua /workspace/artifacts/poc/payloads/poc.lua'",
+            "outer_asan_preload": True,
+            "trigger_timeout_sec": 120,
+        },
+    )
+    assert "libclang_rt\\.asan" in rendered
+    assert 'ldd "/src/lua/src/lua"' in rendered
+    assert rendered.index('ldd "/src/lua/src/lua"') < rendered.index("timeout 120s bash -c")
+    # Still pass _ASAN_RT into bash -c; empty value makes preload a no-op.
+    assert '"${_ASAN_RT}"' in rendered.split("stderr_file=")[-1]
+
+
+def test_should_outer_asan_preload_skips_library_harness_without_inner_preload():
+    from app.tools.log_parsing import should_outer_asan_preload
+
+    assert should_outer_asan_preload("/src/bin payload", "cli-file") is True
+    assert should_outer_asan_preload("export LD_PRELOAD=/lib/asan.so; /tmp/h", "cli-file") is False
+    assert should_outer_asan_preload("clang++ -fsanitize=address ... && timeout 90s /tmp/qimage_harness", "") is False
+    assert should_outer_asan_preload("clang++ -fsanitize=address -shared-libasan -o /tmp/qimage_harness x.cpp && timeout 90s /tmp/qimage_harness p", "library-harness") is False
+
+
+def test_poc_run_template_skips_outer_preload_for_sanitized_qimage_harness():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="/src/kimageformats/build/bin/imageformats/kimg_xcf.so",
+        payload_filename="crafted_bpp5.xcf",
+        payload_content="xcf\n",
+    )
+    normalized = stage._normalize_poc_plan(
+        plan,
+        repo_url="https://invent.kde.org/frameworks/kimageformats.git",
+    )
+    from app.tools.log_parsing import should_outer_asan_preload
+
+    assert normalized.trigger_mode == "library-harness"
+    assert "timeout 90s env LD_PRELOAD=" in normalized.run_command
+    assert "export LD_PRELOAD" not in normalized.run_command
+    assert should_outer_asan_preload(normalized.run_command, normalized.trigger_mode) is False
+
+    rendered = stage._render_template(
+        "poc_run.sh.j2",
+        {
+            "poc_artifacts_dir": "/workspace/artifacts/poc",
+            "execution_dir": "/src/kimageformats",
+            "target_binary": normalized.target_binary,
+            "target_binary_echo": normalized.target_binary,
+            "run_command": normalized.run_command,
+            "run_command_echo": "qimage_harness",
+            "run_command_shell": "'qimage_harness'",
+            "outer_asan_preload": should_outer_asan_preload(
+                normalized.run_command, normalized.trigger_mode
+            ),
+            "trigger_timeout_sec": 120,
+        },
+    )
+    trigger_block = rendered.split("stderr_file=")[-1]
+    assert 'export LD_PRELOAD="${_ASAN_RT}' not in trigger_block
+    assert "-fsanitize=address" not in normalized.run_command
+    assert "-shared-libasan" not in normalized.run_command
+    assert "timeout 90s env LD_PRELOAD=" in normalized.run_command
+
+
+def test_normalize_poc_plan_leaves_executable_targets_unchanged():
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="/src/lua/lua",
+        payload_filename="poc.lua",
+        payload_content="print(1)\n",
+        run_command="/src/lua/lua /workspace/artifacts/poc/payloads/poc.lua",
+    )
+
+    normalized = stage._normalize_poc_plan(plan, repo_url="https://github.com/lua/lua.git")
+
+    assert normalized.target_binary == "/src/lua/lua"
+    assert normalized.trigger_mode != "library-harness"
+    assert "qimage_harness" not in normalized.run_command
 
 
 def test_normalize_poc_plan_aligns_bare_binary_command_with_container_path():
@@ -624,6 +1376,174 @@ def test_normalize_poc_plan_aligns_bare_binary_command_with_container_path():
 
     assert normalized.target_binary == "/src/lua/lua"
     assert normalized.run_command == "'/src/lua/lua' /workspace/artifacts/poc/payloads/poc.lua"
+
+
+def test_normalize_poc_plan_fixes_nested_src_binary_and_decodes_base64_payload():
+    stage = poc_module.PocStage()
+    # base64 of: local x=1\nfunction f()\nreturn x\nend\n
+    encoded = "bG9jYWwgeD0xCmZ1bmN0aW9uIGYoKQpyZXR1cm4geAplbmQK"
+    plan = poc_module.PocPlan(
+        target_binary="/src/lua/src/lua",
+        payload_filename="poc.lua",
+        payload_content=encoded,
+        run_command="cd /src/lua && ./src/lua {payload}",
+    )
+
+    normalized = stage._normalize_poc_plan(plan, repo_url="https://github.com/lua/lua.git")
+
+    assert normalized.target_binary == "/src/lua/lua"
+    assert "function" in normalized.payload_content
+    assert "bG9jYWw" not in normalized.payload_content
+    assert normalized.run_command == (
+        "cd /src/lua && /src/lua/lua /workspace/artifacts/poc/payloads/poc.lua"
+    )
+
+
+def test_normalize_poc_plan_restores_form_feed_from_recipe_base64():
+    stage = poc_module.PocStage()
+    # Contains a form-feed (0x0c) before the final `c""`.
+    encoded = (
+        "bG9jYWwgdSxfLE4sXyx3LE4sZCxXCmZ1bmN0aW9uIGMoRSxMLGwsUyxULHUsTSxULGwsaCxoLHUsdSxsLGgsaCx1"
+        "LHUsTSx1LHUsdSxsLGgsaCxsKXM9cyBsb2NhbAllLGUsXyxfLE4sZSxzMCxOLFYsXyBmdW5jdGlvbiBjKGIsbClp"
+        "LHM9TiBsb2NhbCBjIGxvY2FsIF9FTlY8Y29uc3Q+ID0wIG89MCBmdW5jdGlvbiBlKCllbmQ7ZSIicmV0dXJuIGVu"
+        "ZDtlMCxhLHcscyxzLHM9IiJyZXR1cm4jYyIiZW5kO2VlPSIicmV0dXJuDGMiIg=="
+    )
+    mangled = (
+        'local u,_,N,_,w,N,d,W\nfunction c(E,L,l,S,T,u,M,T,l,h,h,u,u,l,h,h,u,u,M,u,u,u,l,h,h,l)'
+        's=s local e,e,_,_,N,e,s0,N,V,_ function c(b,l)i,s=N local c local _ENV<const> =0 o=0 '
+        'function e()end;e""return end;e0,a,w,s,s,s=""return#c""end;ee=""return\\c""'
+    )
+    plan = poc_module.PocPlan(
+        target_binary="/src/lua/lua",
+        payload_filename="poc.lua",
+        payload_content=mangled,
+        run_command="/src/lua/lua {payload}",
+    )
+
+    normalized = stage._normalize_poc_plan(
+        plan,
+        repo_url="https://github.com/lua/lua.git",
+        recipe_base64_blobs=[encoded],
+    )
+
+    assert "\x0c" in normalized.payload_content
+    assert r"\c" not in normalized.payload_content.replace("\x0c", "")
+
+
+def test_extract_recipe_base64_blobs_from_artifact_commands():
+    stage = poc_module.PocStage()
+    encoded = "bG9jYWwgeD0xCmZ1bmN0aW9uIGYoKQpyZXR1cm4geAplbmQK"
+    recipes = [
+        ReproductionRecipe(
+            artifact_generation_commands=[f'echo -n "{encoded}" | base64 -d > poc'],
+            steps=[f'echo -n "{encoded}" | base64 -d > poc'],
+        )
+    ]
+
+    blobs = stage._extract_recipe_base64_blobs(recipes)
+
+    assert blobs == [encoded]
+
+
+def test_unwrap_nested_base64_payload_decodes_script_stored_as_base64():
+    import base64
+
+    stage = poc_module.PocStage()
+    # Same shape as CVE-2022-28805 vuln_pocs/poc.lua: on-disk file is base64 text.
+    lua = (
+        "local u,_,N,_,w,N,d,W\n"
+        "function c() local _ENV<const> =0 end\n"
+        'return\x0cc""\n'
+    )
+    nested = base64.b64encode(lua.encode("latin-1")).decode("ascii")
+    unwrapped = stage._unwrap_nested_base64_payload(nested)
+    assert "local " in unwrapped
+    assert "_ENV<const>" in unwrapped
+    assert "\x0c" in unwrapped
+    assert not unwrapped.strip().startswith("bG9j")
+
+
+def test_unwrap_nested_base64_payload_leaves_binary_seed_alone():
+    stage = poc_module.PocStage()
+    binary = "\x00\x01clusterfuzz-seed\xff\xfe"
+    assert stage._unwrap_nested_base64_payload(binary) == binary
+
+
+def test_apply_authoritative_dataset_poc_unwraps_nested_base64_script():
+    import base64
+
+    stage = poc_module.PocStage()
+    lua = (
+        "local u,_,N,_,w,N,d,W\n"
+        "function c() local _ENV<const> =0 end\n"
+        'return\x0cc""\n'
+    )
+    # Transport blob encodes the on-disk file (itself still base64 of lua).
+    on_disk = base64.b64encode(lua.encode("latin-1")).decode("ascii")
+    transport = base64.b64encode(on_disk.encode("ascii")).decode("ascii")
+    plan = poc_module.PocPlan(
+        target_binary="/src/lua/lua",
+        payload_filename="poc.lua",
+        payload_content="trigger\n",
+        run_command="/src/lua/lua /workspace/artifacts/poc/payloads/poc.lua",
+    )
+    context = poc_module.PocContext(
+        cve_id="CVE-2022-28805",
+        chosen_strategy="dataset_poc",
+        dataset_poc_filenames=["poc.lua"],
+        dataset_poc_base64_blobs=[transport],
+    )
+
+    updated = stage._apply_authoritative_payload(plan, context)
+
+    assert "local " in updated.payload_content
+    assert "_ENV<const>" in updated.payload_content
+    assert "\x0c" in updated.payload_content
+    assert not updated.payload_content.lstrip().startswith("bG9j")
+
+
+def test_apply_authoritative_dataset_poc_keeps_binary_clusterfuzz_bytes():
+    import base64
+
+    stage = poc_module.PocStage()
+    seed = b"\x00\x01\x02minimized-seed\xff"
+    transport = base64.b64encode(seed).decode("ascii")
+    plan = poc_module.PocPlan(
+        target_binary="/src/matio/matio_fuzzer",
+        payload_filename="clusterfuzz-testcase-minimized-matio_fuzzer-1",
+        payload_content="trigger\n",
+        run_command="/src/matio/matio_fuzzer /workspace/artifacts/poc/payloads/x",
+    )
+    context = poc_module.PocContext(
+        cve_id="CVE-2021-36977",
+        chosen_strategy="dataset_poc",
+        dataset_poc_filenames=["clusterfuzz-testcase-minimized-matio_fuzzer-1"],
+        dataset_poc_base64_blobs=[transport],
+    )
+
+    updated = stage._apply_authoritative_payload(plan, context)
+
+    assert updated.payload_content.encode("latin-1", errors="replace") == seed
+
+
+def test_execute_poc_plan_writes_payload_as_latin1(tmp_path):
+    stage = poc_module.PocStage()
+    paths = poc_module.PocStagePaths(str(tmp_path / "ws"))
+    stage._prepare_workspace(paths)
+    plan = poc_module.PocPlan(
+        target_binary="/src/lua/lua",
+        payload_filename="poc.lua",
+        payload_content='return\x0cc""\n',
+        run_command="/src/lua/lua {payload}",
+    )
+
+    # Avoid docker: only exercise the payload write portion.
+    payload_path = paths.payloads_dir / plan.payload_filename
+    stage.file_tool.write_latin1(str(payload_path), plan.payload_content)
+
+    raw = payload_path.read_bytes()
+    assert b"\x0c" in raw
+    assert raw == b'return\x0cc""\n'
 
 
 def test_default_execution_dir_prefers_parent_of_absolute_target_binary():
@@ -1134,3 +2054,54 @@ def test_route_after_poc_advances_when_executed_but_unverified():
         "retry_count": {},
     }
     assert route_after_poc(state) == "verify"
+
+
+def test_select_target_args_forces_file_argv_for_ossfuzz_harness():
+    stage = poc_module.PocStage()
+    knowledge = make_knowledge()
+    context = poc_module.PocContext(
+        cve_id="CVE-2021-36978",
+        inferred_input_modes=["stdin", "file"],
+    )
+    payload = "clusterfuzz-testcase-minimized-qpdf_fuzzer-5162370603286528.cil"
+    args = stage._select_target_args(
+        knowledge,
+        payload,
+        context,
+        target_binary="/src/qpdf/fuzz/build/qpdf_fuzzer",
+    )
+    assert args == [f"/workspace/artifacts/poc/payloads/{payload}"]
+    assert not any(a.strip().startswith("<") for a in args)
+
+
+def test_normalize_poc_plan_coerces_quoted_stdin_redirect_for_fuzzer():
+    stage = poc_module.PocStage()
+    payload = "clusterfuzz-testcase-minimized-qpdf_fuzzer-1.cil"
+    plan = poc_module.PocPlan(
+        trigger_mode="cli-stdin",
+        target_binary="/src/qpdf/fuzz/build/qpdf_fuzzer",
+        target_args=[f"< /workspace/artifacts/poc/payloads/{payload}"],
+        payload_filename=payload,
+        payload_content="fuzz",
+        run_command=(
+            f"'/src/qpdf/fuzz/build/qpdf_fuzzer' "
+            f"'< /workspace/artifacts/poc/payloads/{payload}'"
+        ),
+    )
+    normalized = stage._normalize_poc_plan(plan, repo_url="https://github.com/qpdf/qpdf.git")
+    assert normalized.trigger_mode == "cli-file"
+    assert normalized.target_args == [f"/workspace/artifacts/poc/payloads/{payload}"]
+    assert "'<" not in normalized.run_command
+    assert f"/workspace/artifacts/poc/payloads/{payload}" in normalized.run_command
+    assert normalized.run_command.startswith("'/src/qpdf/fuzz/build/qpdf_fuzzer'")
+
+
+def test_build_run_command_keeps_stdin_redirect_unquoted():
+    stage = poc_module.PocStage()
+    command = stage._build_run_command(
+        "/src/tool/bin",
+        ["< /workspace/artifacts/poc/payloads/poc.bin"],
+    )
+    assert command == "'/src/tool/bin' < '/workspace/artifacts/poc/payloads/poc.bin'"
+    assert "'<" not in command
+    assert " < " in command

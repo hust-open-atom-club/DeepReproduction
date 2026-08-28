@@ -1,0 +1,34 @@
+# Resolve in-tree shared libraries that were built but not installed to /usr.
+# Covers the common "libfoo.so.N: cannot open shared object file" failure when
+# the target links against a sibling build output under /src (e.g. libsepol.so.2).
+_augment_ld_path_for_missing_libs() {
+  local bin="$1"
+  [[ -n "$bin" && -e "$bin" ]] || return 0
+  command -v ldd >/dev/null 2>&1 || return 0
+
+  local _pass line lib found changed
+  for _pass in 1 2 3; do
+    changed=0
+    while IFS= read -r line; do
+      case "$line" in
+        *" => not found")
+          lib="$(printf '%s\n' "$line" | awk '{print $1}')"
+          [[ -n "$lib" ]] || continue
+          found="$(
+            find "$(dirname -- "$bin")" /src \
+              -name "$lib" \( -type f -o -type l \) 2>/dev/null \
+              | head -n 1
+          )"
+          if [[ -n "$found" ]]; then
+            export LD_LIBRARY_PATH="$(dirname -- "$found")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            changed=1
+          fi
+          ;;
+      esac
+    done < <(ldd "$bin" 2>/dev/null || true)
+    [[ "$changed" -eq 0 ]] && break
+  done
+}
+
+_augment_ld_path_for_missing_libs "{{ target_binary }}"
+

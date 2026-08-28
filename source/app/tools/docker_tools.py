@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from app.tools.process_tools import ProcessRequest, ProcessTool
+from app.tools.process_tools import ProcessRequest, ProcessTool, coerce_process_text
 
 
 class DockerBuildRequest(BaseModel):
@@ -44,6 +44,11 @@ class DockerCommandResult(BaseModel):
     exit_code: int = Field(default=1, description="进程退出码")
     stdout: str = Field(default="", description="标准输出")
     stderr: str = Field(default="", description="标准错误")
+
+    @field_validator("stdout", "stderr", mode="before")
+    @classmethod
+    def _coerce_captured_text(cls, value: object) -> str:
+        return coerce_process_text(value)
 
 
 class DockerTool:
