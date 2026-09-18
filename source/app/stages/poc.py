@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 from pathlib import Path
@@ -31,15 +33,25 @@ from app.config import build_chat_model, load_app_config
 from app.schemas.build_artifact import BuildArtifact
 from app.schemas.knowledge import KnowledgeModel, ReproductionRecipe
 from app.schemas.poc_artifact import PoCArtifact
-from app.stages.build import parse_llm_json_payload
+from app.stages.asan_hardening import ensure_no_pie_for_asan
+from app.stages.build import BuildStage, parse_llm_json_payload
+from app.templates.poc_templates import format_template_for_prompt, select_template
 from app.tools.docker_tools import DockerBuildRequest, DockerRunRequest, DockerTool
 from app.tools.file_tools import FileTool
 from app.tools.log_parsing import (
+    drop_generic_sanitizer_labels,
+    drop_weak_crash_labels_when_specific,
+    ensure_specific_crash_token_in_patterns,
     extract_block as _extract_block_module,
     extract_execution_observation as _extract_execution_observation_module,
+    filter_hits_for_specific_sanitizer,
+    haystack_has_specific_sanitizer_bug,
     match_patterns as _match_patterns_module,
+    should_outer_asan_preload,
+    specific_sanitizer_bugs_in,
 )
 from app.tools.patch_tools import find_patch_diff
+from app.tools import ossfuzz as ossfuzz_tools
 
 
 class PocStagePaths:
@@ -84,6 +96,22 @@ class PocContext(BaseModel):
     knowledge_summary: str = Field(default="", description="Knowledge summary.")
     reproduction_hints: list[str] = Field(default_factory=list, description="Reproduction hints from knowledge.")
     reproduction_recipe_summaries: list[str] = Field(default_factory=list, description="Structured reproduction recipe summaries.")
+    recipe_base64_blobs: list[str] = Field(
+        default_factory=list,
+        description="Base64 payload blobs extracted from reproduction recipes (source of truth for binary-safe decode).",
+    )
+    dataset_poc_base64_blobs: list[str] = Field(
+        default_factory=list,
+        description="Base64 blobs for binary/text PoCs discovered under Dataset/*/vuln_pocs.",
+    )
+    dataset_poc_filenames: list[str] = Field(
+        default_factory=list,
+        description="Filenames corresponding to dataset_poc_base64_blobs.",
+    )
+    dataset_payload_cursor: int = Field(
+        default=0,
+        description="Index into dataset_poc_base64_blobs selected for the current attempt.",
+    )
     expected_error_patterns: list[str] = Field(default_factory=list, description="Expected error patterns.")
     expected_stack_keywords: list[str] = Field(default_factory=list, description="Expected stack keywords.")
     candidate_entrypoints: list[str] = Field(default_factory=list, description="Candidate entrypoints.")
@@ -235,12 +263,56 @@ class PocPlanner:
                 raise RuntimeError("poc_agent did not return a valid strategy.")
             context.chosen_strategy = strategy.chosen_strategy
             context.chosen_strategy_rationale = strategy.rationale
+
+        if context.chosen_strategy in {"dataset_poc", "reproduction_recipe"}:
+            authoritative = self.stage._build_authoritative_poc_plan(
+                knowledge=knowledge,
+                build=build,
+                context=context,
+            )
+            if authoritative is not None:
+                self.stage._persist_poc_llm_trace(
+                    context.planner_attempt,
+                    "decision.txt",
+                    (
+                        f"Skipped LLM plan generation for strategy={context.chosen_strategy}; "
+                        "built a deterministic plan from authoritative payload bytes."
+                    ),
+                )
+                return self.stage._apply_vulnerable_hdf5_cve_match_policy_if_gated(
+                    authoritative, build
+                )
+
         llm_plan = self.try_llm_plan(knowledge=knowledge, build=build, context=context)
         if llm_plan is not None:
-            return self.stage._normalize_poc_plan(llm_plan, repo_url=context.repo_url)
+            normalized = self.stage._normalize_poc_plan(
+                llm_plan,
+                repo_url=context.repo_url,
+                recipe_base64_blobs=context.recipe_base64_blobs,
+                dataset_poc_base64_blobs=context.dataset_poc_base64_blobs,
+                dataset_poc_filenames=context.dataset_poc_filenames,
+            )
+            normalized = self.stage._apply_authoritative_payload(normalized, context)
+            return self.stage._apply_vulnerable_hdf5_cve_match_policy_if_gated(
+                normalized, build
+            )
         raise RuntimeError("poc_agent did not return a valid plan.")
 
     def select_strategy(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> Optional[PocStrategyDecision]:
+        preferred = self.stage._preferred_authoritative_strategy(context)
+        if preferred is not None:
+            decision = PocStrategyDecision(
+                chosen_strategy=preferred,
+                rationale=f"Authoritative {preferred} evidence is present; prefer it over llm_synthesized.",
+                evidence=self.stage._authoritative_strategy_evidence(context, preferred),
+            )
+            self.stage._persist_poc_strategy_trace(
+                context.planner_attempt,
+                "decision.json",
+                json.dumps(decision.model_dump(mode="json"), ensure_ascii=False, indent=2),
+            )
+            return decision
+
         try:
             model = build_chat_model(
                 "poc_agent",
@@ -323,15 +395,24 @@ class PocPlanner:
         previous_plan: PocPlan,
         previous_artifact: PoCArtifact,
     ) -> Optional[PocPlan]:
+        failure_kind = self.stage._classify_failure_kind(previous_artifact.execution_logs)
+        preferred = self.stage._preferred_authoritative_strategy(context)
+        strategy = context.chosen_strategy
+        rationale = context.chosen_strategy_rationale
+        if failure_kind == "payload_invalid" and preferred and preferred != strategy:
+            strategy = preferred
+            rationale = f"Switched to {preferred} after payload parse/compile failure."
         retry_context = context.model_copy(
             update={
                 "planner_attempt": context.planner_attempt + 1,
-                "chosen_strategy": context.chosen_strategy,
-                "chosen_strategy_rationale": context.chosen_strategy_rationale,
-                "previous_failure_kind": self.stage._classify_failure_kind(previous_artifact.execution_logs),
+                "chosen_strategy": strategy,
+                "chosen_strategy_rationale": rationale,
+                "previous_failure_kind": failure_kind,
                 "previous_execution_log": previous_artifact.execution_logs[:6000],
             }
         )
+        context.chosen_strategy = strategy
+        context.chosen_strategy_rationale = rationale
         return self.try_llm_plan(
             knowledge=knowledge,
             build=build,
@@ -411,7 +492,17 @@ class PocPlanner:
                     return None
                 if previous_plan is not None:
                     failure_kind = context.previous_failure_kind or self.stage._classify_failure_kind(previous_artifact.execution_logs if previous_artifact else "")
-                    normalized_plan = self.stage._normalize_poc_plan(plan, repo_url=context.repo_url)
+                    normalized_plan = self.stage._normalize_poc_plan(
+                        plan,
+                        repo_url=context.repo_url,
+                        recipe_base64_blobs=context.recipe_base64_blobs,
+                        dataset_poc_base64_blobs=context.dataset_poc_base64_blobs,
+                        dataset_poc_filenames=context.dataset_poc_filenames,
+                    )
+                    normalized_plan = self.stage._apply_authoritative_payload(normalized_plan, context)
+                    normalized_plan = self.stage._apply_vulnerable_hdf5_cve_match_policy_if_gated(
+                        normalized_plan, build
+                    )
                     if not self.stage._is_valid_replan_candidate(previous_plan, normalized_plan, failure_kind=failure_kind):
                         self.stage._persist_poc_llm_trace(
                             context.planner_attempt,
@@ -419,7 +510,8 @@ class PocPlanner:
                             f"Rejected replan candidate for failure kind: {failure_kind or 'unknown'}",
                         )
                         return None
-                return plan
+                    return normalized_plan
+                return self.stage._apply_vulnerable_hdf5_cve_match_policy_if_gated(plan, build)
             except Exception as error:
                 error_text = str(error)
                 retry_errors.append(f"Attempt {invoke_attempt}: {error_text}")
@@ -450,6 +542,12 @@ class PocStage:
     REFERENCE_POC_BLOCK_LIMIT = 2
     REFERENCE_POC_CHAR_LIMIT = 1200
     REFERENCE_POC_SUMMARY_CHAR_LIMIT = 220
+    MAX_SYNTHESIZED_PAYLOAD_CHARS = 64 * 1024
+    DATASET_POC_BYTE_LIMIT = 256 * 1024
+    # Maximum number of Dataset/*/vuln_pocs payloads collected per CVE. Kept
+    # separate from REFERENCE_POC_BLOCK_LIMIT: one CVE can harvest multiple
+    # ClusterFuzz testcases and only some of them trigger the sanitizer.
+    DATASET_POC_COUNT_LIMIT = 8
     PREVIOUS_EXECUTION_LOG_CHAR_LIMIT = 3500
     PREVIOUS_RUN_SCRIPT_CHAR_LIMIT = 2000
     PREVIOUS_PAYLOAD_CHAR_LIMIT = 2000
@@ -507,6 +605,8 @@ class PocStage:
         candidate_entrypoints.extend(self._discover_candidate_binaries(paths.repo_dir))
         trigger_files = patch_affected_files or list(knowledge.affected_files)
         reproduction_recipe_summaries = self._summarize_reproduction_recipes(knowledge.reproduction_recipes)
+        recipe_base64_blobs = self._extract_recipe_base64_blobs(knowledge.reproduction_recipes)
+        dataset_poc_filenames, dataset_poc_base64_blobs = self._collect_dataset_poc_payloads(knowledge.cve_id)
         cli_flags = self._extract_candidate_cli_flags(knowledge.reproduction_hints + reproduction_recipe_summaries)
         reference_poc_summaries = self._collect_reference_poc_summaries(knowledge.cve_id)
         repo_evidence_blocks = self._collect_repo_evidence(paths.repo_dir, trigger_files)
@@ -532,6 +632,9 @@ class PocStage:
             knowledge_summary=knowledge.summary,
             reproduction_hints=list(knowledge.reproduction_hints),
             reproduction_recipe_summaries=reproduction_recipe_summaries,
+            recipe_base64_blobs=recipe_base64_blobs,
+            dataset_poc_base64_blobs=dataset_poc_base64_blobs,
+            dataset_poc_filenames=dataset_poc_filenames,
             expected_error_patterns=list(knowledge.expected_error_patterns),
             expected_stack_keywords=list(knowledge.expected_stack_keywords),
             candidate_entrypoints=sorted(set(candidate_entrypoints)),
@@ -616,12 +719,261 @@ class PocStage:
 
     def _available_poc_strategies(self, context: PocContext) -> list[str]:
         strategies = ["llm_synthesized"]
-        if context.reproduction_recipe_summaries:
+        if context.reproduction_recipe_summaries or context.recipe_base64_blobs:
             strategies.insert(0, "reproduction_recipe")
-        if context.reference_poc_summaries:
+        if context.dataset_poc_base64_blobs or context.dataset_poc_filenames or context.reference_poc_summaries:
             insert_at = 1 if strategies and strategies[0] == "reproduction_recipe" else 0
             strategies.insert(insert_at, "dataset_poc")
         return strategies
+
+    def _preferred_authoritative_strategy(self, context: PocContext) -> Optional[str]:
+        """Prefer dataset/recipe strategies whenever authoritative payloads exist."""
+
+        available = self._available_poc_strategies(context)
+        if "dataset_poc" in available and (
+            context.dataset_poc_base64_blobs or context.dataset_poc_filenames or context.reference_poc_summaries
+        ):
+            return "dataset_poc"
+        if "reproduction_recipe" in available and (
+            context.reproduction_recipe_summaries or context.recipe_base64_blobs
+        ):
+            return "reproduction_recipe"
+        return None
+
+    def _authoritative_strategy_evidence(self, context: PocContext, strategy: str) -> list[str]:
+        evidence: list[str] = []
+        if strategy == "dataset_poc":
+            if context.dataset_poc_filenames:
+                evidence.append(f"dataset_poc_files={context.dataset_poc_filenames}")
+            elif context.reference_poc_summaries:
+                evidence.append(f"reference_poc_blocks={len(context.reference_poc_summaries)}")
+            if context.dataset_poc_base64_blobs:
+                evidence.append(f"dataset_poc_blobs={len(context.dataset_poc_base64_blobs)}")
+        elif strategy == "reproduction_recipe":
+            if context.reproduction_recipe_summaries:
+                evidence.append(f"reproduction_recipes={len(context.reproduction_recipe_summaries)}")
+            if context.recipe_base64_blobs:
+                evidence.append(f"recipe_base64_blobs={len(context.recipe_base64_blobs)}")
+        return evidence or [f"strategy={strategy}"]
+
+    def _dataset_payload_index(self, context: PocContext) -> int:
+        """Return the dataset payload index to use for the current attempt.
+
+        Multiple ClusterFuzz testcases can be harvested for one CVE (e.g.
+        OpenEXR). The first seed is not guaranteed to trigger the sanitizer;
+        cycle through them across replan attempts instead of always retrying
+        the same payload.
+        """
+
+        blobs = context.dataset_poc_base64_blobs or []
+        if not blobs:
+            return 0
+        cursor = max(int(context.dataset_payload_cursor or 0), 0)
+        return cursor % len(blobs)
+
+    def _has_untried_dataset_payload(self, context: PocContext) -> bool:
+        """True when the dataset_poc strategy still has an unused seed to try."""
+
+        blobs = context.dataset_poc_base64_blobs or []
+        if not blobs:
+            return False
+        return int(context.dataset_payload_cursor or 0) < len(blobs)
+
+    def _apply_authoritative_payload(self, plan: PocPlan, context: PocContext) -> PocPlan:
+        """Force recipe/dataset bytes into the plan when those strategies are active."""
+
+        strategy = (context.chosen_strategy or "").strip()
+        if strategy == "dataset_poc" and context.dataset_poc_base64_blobs:
+            index = self._dataset_payload_index(context)
+            raw = base64.b64decode(context.dataset_poc_base64_blobs[index])
+            plan.payload_content = raw.decode("latin-1", errors="replace")
+            if context.dataset_poc_filenames and index < len(context.dataset_poc_filenames):
+                plan.payload_filename = Path(context.dataset_poc_filenames[index]).name
+            if not plan.source_of_truth or plan.source_of_truth == "llm_synthesized":
+                plan.source_of_truth = "dataset_poc"
+            plan = self._prefer_compact_dataset_xcf_payload(
+                plan,
+                dataset_poc_filenames=context.dataset_poc_filenames,
+                dataset_poc_base64_blobs=context.dataset_poc_base64_blobs,
+            )
+            plan = self._prefer_ossfuzz_minimized_payload(
+                plan,
+                dataset_poc_filenames=context.dataset_poc_filenames,
+                dataset_poc_base64_blobs=context.dataset_poc_base64_blobs,
+            )
+            # Dataset files sometimes store the recipe's ``base64 -d`` input
+            # (transport blob → still base64 text). Unwrap only script-like
+            # nested blobs; binary/ClusterFuzz seeds are left alone.
+            plan.payload_content = self._unwrap_nested_base64_payload(plan.payload_content)
+            return self._sync_payload_filename_into_command(plan)
+
+        if strategy == "reproduction_recipe":
+            if context.recipe_base64_blobs:
+                raw = base64.b64decode(context.recipe_base64_blobs[0])
+                plan.payload_content = self._unwrap_nested_base64_payload(
+                    raw.decode("latin-1", errors="replace")
+                )
+                if not plan.source_of_truth or plan.source_of_truth == "llm_synthesized":
+                    plan.source_of_truth = "reproduction_recipe"
+                return plan
+            extracted = self._extract_embedded_payload_from_recipe_summaries(context.reproduction_recipe_summaries)
+            if extracted is not None:
+                content, filename = extracted
+                plan.payload_content = self._unwrap_nested_base64_payload(content)
+                plan.payload_filename = Path(filename).name
+                if not plan.source_of_truth or plan.source_of_truth == "llm_synthesized":
+                    plan.source_of_truth = "reproduction_recipe"
+        return plan
+
+    def _build_authoritative_poc_plan(
+        self,
+        knowledge: KnowledgeModel,
+        build: BuildArtifact,
+        context: PocContext,
+    ) -> Optional[PocPlan]:
+        """Build a concrete PoC plan without LLM when authoritative payload bytes exist."""
+
+        strategy = (context.chosen_strategy or "").strip()
+        has_dataset = bool(context.dataset_poc_base64_blobs)
+        has_recipe_blob = bool(context.recipe_base64_blobs)
+        if strategy == "dataset_poc" and not has_dataset:
+            return None
+        if strategy == "reproduction_recipe" and not (has_recipe_blob or context.reproduction_recipe_summaries):
+            return None
+        if strategy not in {"dataset_poc", "reproduction_recipe"}:
+            return None
+        if strategy == "reproduction_recipe" and not has_recipe_blob:
+            # Only skip LLM when we can recover payload bytes from recipe blobs/summaries.
+            probe = PocPlan(payload_filename="poc.txt", payload_content="trigger\n", target_binary="placeholder")
+            probe = self._apply_authoritative_payload(probe, context)
+            if probe.payload_content.strip() in {"", "trigger"}:
+                return None
+
+        if strategy == "dataset_poc" and context.dataset_poc_filenames:
+            index = self._dataset_payload_index(context)
+            if index < len(context.dataset_poc_filenames):
+                payload_filename = Path(context.dataset_poc_filenames[index]).name
+            else:
+                payload_filename = "poc.bin"
+        elif strategy == "reproduction_recipe":
+            payload_filename = "poc.bin"
+            for recipe in knowledge.reproduction_recipes[:4]:
+                title = (recipe.source_title or "").strip()
+                if title and "." in Path(title).name:
+                    payload_filename = Path(title).name
+                    break
+        else:
+            payload_filename = "poc.bin"
+
+        target_binary = self._select_target_binary(build, context, payload_filename=payload_filename)
+        payload_path = f"/workspace/artifacts/poc/payloads/{payload_filename}"
+        target_args = self._select_target_args(
+            knowledge=knowledge,
+            payload_filename=payload_filename,
+            context=context,
+            target_binary=target_binary,
+        )
+        if not target_args:
+            target_args = [payload_path]
+
+        crash_type = (knowledge.vulnerability_type or "").strip()
+        lowered = crash_type.lower()
+        if "use-after-free" in lowered or "uaf" in lowered:
+            crash_type = "heap-use-after-free"
+        elif "overflow" in lowered or "over-read" in lowered or "overread" in lowered:
+            crash_type = "heap-buffer-overflow"
+
+        stderr_patterns = list(knowledge.expected_error_patterns) or ["AddressSanitizer"]
+        stack_keywords = [item for item in knowledge.expected_stack_keywords if item][:8]
+
+        plan = PocPlan(
+            trigger_mode="cli-file",
+            target_binary=target_binary,
+            target_args=target_args,
+            environment_variables={},
+            payload_filename=payload_filename,
+            payload_content="trigger\n",
+            auxiliary_files={},
+            run_command="",
+            expected_exit_code=None,
+            expected_stdout_patterns=[],
+            expected_stderr_patterns=stderr_patterns,
+            expected_stack_keywords=stack_keywords,
+            expected_crash_type=crash_type,
+            source_of_truth=strategy,
+            confidence="high",
+            rationale=(
+                f"Deterministic {strategy} plan using authoritative payload "
+                f"{payload_filename} against {target_binary}."
+            ),
+            dockerfile_override=None,
+            run_script_override=None,
+        )
+        normalized = self._normalize_poc_plan(
+            plan,
+            repo_url=context.repo_url,
+            recipe_base64_blobs=context.recipe_base64_blobs,
+            dataset_poc_base64_blobs=context.dataset_poc_base64_blobs,
+            dataset_poc_filenames=context.dataset_poc_filenames,
+        )
+        normalized = self._apply_authoritative_payload(normalized, context)
+        if not (normalized.payload_content or "").strip() or normalized.payload_content.strip() == "trigger":
+            return None
+        return self._apply_vulnerable_hdf5_cve_match_policy_if_gated(normalized, build)
+
+    def _apply_vulnerable_hdf5_cve_match_policy_if_gated(
+        self,
+        plan: PocPlan,
+        build: BuildArtifact,
+    ) -> PocPlan:
+        """Tighten CVE match + ASAN when build used the vulnerable-HDF5 gate."""
+
+        script = build.build_script_content or ""
+        if BuildStage.VULN_HDF5_MARKER not in script:
+            return plan
+        (
+            plan.expected_stderr_patterns,
+            plan.expected_stack_keywords,
+            plan.expected_crash_type,
+            plan.environment_variables,
+        ) = BuildStage.apply_vulnerable_hdf5_cve_match_policy(
+            expected_stderr_patterns=list(plan.expected_stderr_patterns),
+            expected_stack_keywords=list(plan.expected_stack_keywords),
+            expected_crash_type=plan.expected_crash_type or "",
+            environment_variables=dict(plan.environment_variables),
+        )
+        return plan
+
+    def _extract_embedded_payload_from_recipe_summaries(
+        self,
+        summaries: list[str],
+    ) -> Optional[tuple[str, str]]:
+        """Best-effort recovery of CIL/S-expression payload text from recipe YAML dumps."""
+
+        for summary in summaries:
+            lines = [line.rstrip() for line in summary.splitlines()]
+            block: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    if block:
+                        break
+                    continue
+                if stripped.startswith("(") or (
+                    block and (stripped.startswith((")", ";")) or stripped.endswith(")"))
+                ):
+                    block.append(stripped)
+                    continue
+                if block:
+                    break
+            if len(block) >= 3 and block[0].startswith("("):
+                content = "\n".join(block).rstrip() + "\n"
+                filename = "poc.cil" if any(
+                    token in content.lower()
+                    for token in ("classmap", "classmapping", "classpermission", "(class ", "(type ")
+                ) else "poc.txt"
+                return content, filename
+        return None
 
     def _build_strategy_prompt(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> str:
         available_strategies = self._available_poc_strategies(context)
@@ -640,6 +992,8 @@ class PocStage:
                 ensure_ascii=True,
             ),
             f"Available strategies: {json.dumps(available_strategies, ensure_ascii=False)}",
+            "Preference order when multiple strategies are available: reproduction_recipe > dataset_poc > llm_synthesized.",
+            "Choose reproduction_recipe or dataset_poc whenever an explicit recipe/base64/attachment PoC exists; do not invent a new payload in that case.",
             f"CVE: {knowledge.cve_id}",
             f"Summary: {knowledge.summary}",
             f"Vulnerability type: {knowledge.vulnerability_type}",
@@ -685,12 +1039,18 @@ class PocStage:
             "Use that strategy to build the concrete PoC plan. Do not silently switch strategies inside this turn.",
             "Give substantial weight to semantic understanding of the vulnerability and the likely trigger path.",
             "Prefer a minimal reproducible trigger over a large script.",
+            "Never invent multi-kilobyte or megabyte payloads when a recipe base64 blob or dataset PoC already exists.",
+            "When recipe/dataset base64 is present, set payload_content to that base64 string (or the decoded bytes semantics) and keep the original filename when possible.",
+            "Prefer CLI flags from reproduction recipes/hints over inventing short options; if a flag is rejected as unknown, switch to flags shown in evidence.",
+            "If the build target is a shared library or Qt plugin (.so/.dylib/.dll, especially under imageformats/), never execute it directly. Use trigger_mode=library-harness with a tiny loader (for Qt: QImageReader + QT_PLUGIN_PATH).",
             "Adapt any existing PoC or hint to the current workspace layout inside Docker.",
             f"The build image keeps the checked-out project under {self._container_project_dir(context.repo_url)}.",
             "The repository is mounted at /workspace/repo.",
             "Prefer compiled binaries from the build-image project directory. /workspace/repo is a mounted source tree and may not contain built executables.",
+            "Do not prepend `make` / `make -C ...` rebuilds in run_command; the ASan binary is already produced by the build stage. Re-running make often rebuilds without sanitizers or fails on docs tools (e.g. xmlto).",
             "Payload files should normally be written under /workspace/artifacts/poc/payloads/ and auxiliary files under /workspace/artifacts/poc/inputs/.",
             "You may freely change payload filename, suffix, on-disk format, auxiliary files, and wrapper/decoding steps when that improves the trigger.",
+            "ASAN BUILD RULE: whenever run_command compiles the PoC with a sanitizer flag (e.g. -fsanitize=address or -fsanitize=fuzzer,address), ALWAYS add -no-pie to that compile/link command. On WSL2 (vm.mmap_rnd_bits=32) a PIE binary linked against ASan can crash with a bare SIGSEGV (exit 139) during ASan startup, before any ASan report; -no-pie makes the run deterministic.",
             "Return exactly one JSON object and no markdown fences.",
             "Schema:",
             json.dumps(
@@ -742,6 +1102,20 @@ class PocStage:
             "Reference PoC excerpts:",
             "\n\n---\n\n".join(reference_poc_blocks) or "<empty>",
         ]
+        inferred_trigger = context.inferred_input_modes[0] if context.inferred_input_modes else ""
+        template = select_template(
+            trigger_mode=inferred_trigger,
+            vulnerability_type=knowledge.vulnerability_type or "",
+            inferred_input_modes=context.inferred_input_modes,
+            chosen_strategy=context.chosen_strategy,
+            target_binary=context.target_binary,
+        )
+        if template is not None:
+            sections.extend([
+                "",
+                "PoC template reference (adapt to the current CVE, do not copy verbatim):",
+                format_template_for_prompt(template),
+            ])
         if not has_reference_evidence:
             sections.extend(
                 [
@@ -757,15 +1131,17 @@ class PocStage:
                 [
                     "Strategy guidance:",
                     "Use the structured reproduction recipes as the primary source of truth for payload construction and triggering.",
-                    "You may simplify, decode, wrap, or relocate the recipe steps, but keep the recipe semantics.",
+                    "If artifact_generation_commands contain base64 decode steps, copy the base64 blob into payload_content instead of inventing new bytes.",
+                    "You may simplify, decode, wrap, or relocate the recipe steps, but keep the recipe semantics and binary payload intact.",
                 ]
             )
         elif context.chosen_strategy == "dataset_poc":
             sections.extend(
                 [
                     "Strategy guidance:",
-                    "Use the dataset PoC excerpts as the primary source of truth, but you may decode, rename, wrap, or otherwise adapt them before execution.",
-                    "Do not assume the dataset PoC is directly runnable without transformation.",
+                    "Use the dataset PoC excerpts as the primary source of truth.",
+                    "When a dataset PoC is marked ENCODING: base64, put that exact base64 blob into payload_content and keep the FILE name as payload_filename.",
+                    "Do not invent a different payload; only adapt the run command/flags to the current workspace.",
                 ]
             )
 
@@ -791,42 +1167,106 @@ class PocStage:
                     "Adjust the plan to improve the trigger while staying minimal.",
                     "Replan contract:",
                     "- If docker image build failed, you must return a new dockerfile_override.",
+                    "- If the payload failed to parse/compile (payload_invalid), you must change payload_content and/or payload_filename (and keep DSL/CIL syntax valid).",
                     "- If the target ran but did not trigger the expected behavior, you must modify the payload, auxiliary files, run command, environment, or run_script_override.",
                     "- If container execution failed, you must modify how the target is invoked, preferably via run_script_override or by changing target_binary/target_args/run_command/environment.",
                     "- Do not only change rationale, confidence, or source_of_truth.",
                 ]
             )
+            if failure_kind == "payload_invalid":
+                sections.extend(
+                    [
+                        "Payload invalid guidance:",
+                        "The previous payload was rejected by the target parser/compiler before the vulnerable path ran.",
+                        "Do not keep inventing similar invalid syntax. Prefer any dataset/recipe payload verbatim, or emit a minimal syntactically valid policy/input for this DSL.",
+                        "Changing only flags or the run command is insufficient for payload_invalid.",
+                    ]
+                )
         return "\n".join(sections)
 
-    def _normalize_poc_plan(self, plan: PocPlan, repo_url: str = "") -> PocPlan:
+    def _normalize_poc_plan(
+        self,
+        plan: PocPlan,
+        repo_url: str = "",
+        recipe_base64_blobs: Optional[list[str]] = None,
+        dataset_poc_base64_blobs: Optional[list[str]] = None,
+        dataset_poc_filenames: Optional[list[str]] = None,
+    ) -> PocPlan:
         if not plan.payload_filename:
             plan.payload_filename = "poc.txt"
         if not plan.payload_content:
             plan.payload_content = "trigger\n"
+        authoritative_blobs = list(recipe_base64_blobs or []) + list(dataset_poc_base64_blobs or [])
+        plan.payload_content = self._resolve_payload_content(plan.payload_content, authoritative_blobs)
+        if (
+            dataset_poc_filenames
+            and authoritative_blobs
+            and self._payload_matches_blob(plan.payload_content, authoritative_blobs)
+            and (not plan.payload_filename or plan.payload_filename in {"poc.txt", "trigger", "payload"})
+        ):
+            plan.payload_filename = dataset_poc_filenames[0]
         plan.payload_filename = Path(plan.payload_filename).name
+        plan = self._prefer_compact_dataset_xcf_payload(
+            plan,
+            dataset_poc_filenames=dataset_poc_filenames,
+            dataset_poc_base64_blobs=dataset_poc_base64_blobs,
+        )
+        plan = self._prefer_ossfuzz_minimized_payload(
+            plan,
+            dataset_poc_filenames=dataset_poc_filenames,
+            dataset_poc_base64_blobs=dataset_poc_base64_blobs,
+        )
+        plan = self._sync_payload_filename_into_command(plan)
         plan.auxiliary_files = self._normalize_auxiliary_files(plan.auxiliary_files)
         plan.target_binary = self._normalize_target_binary(plan.target_binary, repo_url)
+        plan.target_binary = self._correct_nested_src_binary_path(plan.target_binary, repo_url)
+        plan.target_binary = self._correct_qt_plugin_binary_path(plan.target_binary)
+        plan.target_binary = self._rewrite_non_executable_or_qt_plugin_target(
+            plan.target_binary, plan.payload_filename, repo_url
+        )
+        plan.target_binary = self._correct_qt_plugin_binary_path(plan.target_binary)
         plan.target_args = [self._normalize_workspace_arg(arg, plan.payload_filename) for arg in plan.target_args]
         if not plan.run_command:
-            args = " ".join(self._shell_quote(item) for item in plan.target_args)
-            plan.run_command = f"{self._shell_quote(plan.target_binary)} {args}".strip()
+            plan.run_command = self._build_run_command(plan.target_binary, plan.target_args)
         else:
             plan.run_command = self._normalize_run_command(plan.run_command, plan.payload_filename, repo_url)
+            plan.run_command = self._rewrite_nested_src_binary_in_command(plan.run_command, repo_url)
+            plan.run_command = self._strip_pre_run_make_rebuild(plan.run_command)
             plan.run_command = self._align_run_command_with_target_binary(plan.run_command, plan.target_binary)
+        plan = self._coerce_ossfuzz_harness_file_argv(plan)
+        plan = self._ensure_shared_library_harness(plan)
+        plan.run_command = ensure_no_pie_for_asan(plan.run_command)
+        plan.expected_stderr_patterns = ensure_specific_crash_token_in_patterns(
+            plan.expected_stderr_patterns,
+            plan.expected_crash_type,
+        )
         if not plan.expected_stderr_patterns and plan.expected_crash_type:
             plan.expected_stderr_patterns = [plan.expected_crash_type]
-        plan.expected_stack_keywords = sorted(set(plan.expected_stack_keywords))
+        crash_extra = [plan.expected_crash_type] if plan.expected_crash_type else []
+        plan.expected_stderr_patterns = drop_generic_sanitizer_labels(
+            plan.expected_stderr_patterns,
+            extra_texts=crash_extra,
+        )
+        plan.expected_stderr_patterns = drop_weak_crash_labels_when_specific(
+            plan.expected_stderr_patterns,
+            extra_texts=crash_extra,
+        )
+        extra_asan_context = list(plan.expected_stderr_patterns) + crash_extra
+        plan.expected_stack_keywords = drop_generic_sanitizer_labels(
+            sorted(set(plan.expected_stack_keywords)),
+            extra_texts=extra_asan_context,
+        )
         return plan
 
     def _execute_poc_plan(self, paths: PocStagePaths, plan_meta: dict, plan: PocPlan) -> PoCArtifact:
         payload_path = paths.payloads_dir / plan.payload_filename
-        self.file_tool.write_text(str(payload_path), plan.payload_content)
+        self.file_tool.write_latin1(str(payload_path), plan.payload_content)
 
         auxiliary_paths: list[str] = []
         for name, content in plan.auxiliary_files.items():
             target_dir = paths.inputs_dir if "/" not in name else paths.poc_dir
             target_path = target_dir / name
-            self.file_tool.write_text(str(target_path), content)
+            self.file_tool.write_latin1(str(target_path), content)
             auxiliary_paths.append(str(target_path))
 
         docker_context = {
@@ -840,7 +1280,14 @@ class PocStage:
             "execution_dir": self._default_execution_dir(plan.target_binary),
             "poc_artifacts_dir": "/workspace/artifacts/poc",
             "target_binary": plan.target_binary,
+            "target_binary_echo": self._escape_for_echo(plan.target_binary),
             "run_command": plan.run_command,
+            "run_command_echo": self._escape_for_echo(plan.run_command),
+            "run_command_shell": self._shell_quote(plan.run_command or "true"),
+            "outer_asan_preload": should_outer_asan_preload(
+                plan.run_command, plan.trigger_mode
+            ),
+            "trigger_timeout_sec": 120,
         }
 
         dockerfile_content = (
@@ -849,7 +1296,7 @@ class PocStage:
             else self._render_template("poc.Dockerfile.j2", docker_context)
         )
         run_script_content = (
-            plan.run_script_override.rstrip() + "\n"
+            ensure_no_pie_for_asan(plan.run_script_override.rstrip()) + "\n"
             if plan.run_script_override
             else self._render_template("poc_run.sh.j2", script_context)
         )
@@ -900,6 +1347,11 @@ class PocStage:
         matched_error_patterns = list(matched_stderr_patterns)
 
         execution_success = docker_build_result.success and bool(run_result.success)
+        failure_kind = self._classify_failure_kind(execution_logs)
+        if failure_kind == "payload_invalid":
+            # Parser/compiler rejected the payload before the vulnerable path; treat as a failed
+            # PoC attempt so internal/outer retries replan instead of advancing to verify.
+            execution_success = False
         run_verify_report = self._build_run_verify_report(
             plan=plan,
             observation=observation,
@@ -908,6 +1360,9 @@ class PocStage:
             matched_stdout_patterns=matched_stdout_patterns,
             matched_stack_keywords=matched_stack_keywords,
         )
+        if failure_kind == "payload_invalid":
+            run_verify_report.eligible_for_verify = False
+            run_verify_report.eligibility_reason = "payload_invalid: parser/compiler rejected payload"
         self.file_tool.safe_persist(
             str(paths.run_verify_yaml),
             yaml.safe_dump(run_verify_report.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
@@ -982,7 +1437,9 @@ class PocStage:
                 "done": END,
             },
         )
-        return builder.compile()
+        # False: do not inherit the parent workflow checkpointer. Internal state
+        # carries PocStagePaths, which is not msgpack-serializable.
+        return builder.compile(checkpointer=False)
 
     def _poc_graph_prepare_node(self, state: PocGraphState) -> PocGraphState:
         prepared = self.prepare_poc_run(
@@ -1022,15 +1479,32 @@ class PocStage:
                 outcome.artifact,
             )
             updates["current_context"] = current_context
-            replanned = self.replan_after_failure(
-                knowledge=state["knowledge"],
-                build=state["build"],
-                context=current_context,
-                previous_plan=plan,
-                previous_artifact=outcome.artifact,
-            )
+            # When there are untried authoritative dataset payloads, skip the LLM
+            # replan entirely and let the next "plan" node deterministically advance
+            # to the next seed. LLM replans here are slow and, for dataset_poc, are
+            # overwritten by _build_authoritative_poc_plan anyway.
+            if self._has_untried_dataset_payload(current_context):
+                replanned = None
+            else:
+                replanned = self.replan_after_failure(
+                    knowledge=state["knowledge"],
+                    build=state["build"],
+                    context=current_context,
+                    previous_plan=plan,
+                    previous_artifact=outcome.artifact,
+                )
             if replanned is not None:
-                updates["current_plan"] = self._normalize_poc_plan(replanned, repo_url=current_context.repo_url)
+                normalized = self._normalize_poc_plan(
+                    replanned,
+                    repo_url=current_context.repo_url,
+                    recipe_base64_blobs=current_context.recipe_base64_blobs,
+                    dataset_poc_base64_blobs=current_context.dataset_poc_base64_blobs,
+                    dataset_poc_filenames=current_context.dataset_poc_filenames,
+                )
+                normalized = self._apply_authoritative_payload(normalized, current_context)
+                updates["current_plan"] = self._apply_vulnerable_hdf5_cve_match_policy_if_gated(
+                    normalized, state["build"]
+                )
         return updates
 
     def _route_after_poc_execute(self, state: PocGraphState) -> str:
@@ -1040,6 +1514,11 @@ class PocStage:
             return "done"
         if outcome.artifact.execution_success and outcome.artifact.reproducer_verified:
             return "done"
+        # When multiple authoritative dataset payloads exist, keep cycling through
+        # them until one triggers (or the cursor wraps past the last seed).
+        context = state.get("current_context")
+        if context is not None and self._has_untried_dataset_payload(context):
+            return "plan"
         if attempt >= self.MAX_REPLAN_ATTEMPTS:
             return "done"
         return "plan"
@@ -1091,7 +1570,14 @@ class PocStage:
                 previous_artifact=last_outcome.artifact,
             )
             if replanned is not None:
-                replanned = self._normalize_poc_plan(replanned, repo_url=current_context.repo_url)
+                replanned = self._normalize_poc_plan(
+                    replanned,
+                    repo_url=current_context.repo_url,
+                    recipe_base64_blobs=current_context.recipe_base64_blobs,
+                    dataset_poc_base64_blobs=current_context.dataset_poc_base64_blobs,
+                    dataset_poc_filenames=current_context.dataset_poc_filenames,
+                )
+                replanned = self._apply_authoritative_payload(replanned, current_context)
                 self._write_yaml_file(paths.poc_plan_yaml, replanned.model_dump(mode="json"))
                 last_outcome = self.execute_poc_attempt(paths, prepared.plan_meta, replanned)
                 if (last_outcome.artifact.execution_success and last_outcome.artifact.reproducer_verified) or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
@@ -1129,6 +1615,7 @@ class PocStage:
         return context.model_copy(
             update={
                 "planner_attempt": context.planner_attempt + 1,
+                "dataset_payload_cursor": context.dataset_payload_cursor + 1,
                 "previous_failure_kind": self._classify_failure_kind(artifact.execution_logs),
                 "previous_execution_log": self._truncate_text(
                     artifact.execution_logs,
@@ -1159,6 +1646,14 @@ class PocStage:
             return bool(candidate_plan.dockerfile_override)
         if normalized_failure_kind == "container_run":
             return self._changes_poc_execution_surface(previous_plan, candidate_plan)
+        if normalized_failure_kind == "payload_invalid":
+            return any(
+                [
+                    previous_plan.payload_content != candidate_plan.payload_content,
+                    previous_plan.payload_filename != candidate_plan.payload_filename,
+                    previous_plan.auxiliary_files != candidate_plan.auxiliary_files,
+                ]
+            )
         return self._changes_trigger_strategy(previous_plan, candidate_plan)
 
     def _changes_poc_execution_surface(self, previous_plan: PocPlan, candidate_plan: PocPlan) -> bool:
@@ -1198,13 +1693,32 @@ class PocStage:
 
     def _discover_candidate_binaries(self, repo_dir: Path) -> list[str]:
         candidates: list[str] = []
-        for relative in ("src", "bin", "build", "target/debug"):
+        seen: set[str] = set()
+        # Prefer built outputs over source-tree files (AUTHORS, headers, …).
+        for relative in ("build", "bin", "target/debug", "src"):
             root = repo_dir / relative
             if not root.exists():
                 continue
             for path in root.rglob("*"):
-                if path.is_file() and path.suffix in {"", ".sh", ".py", ".pl", ".lua"}:
-                    candidates.append(str(path.relative_to(repo_dir)))
+                if not path.is_file():
+                    continue
+                rel = str(path.relative_to(repo_dir)).replace("\\", "/")
+                if rel in seen or self._looks_like_non_executable_source(rel):
+                    continue
+                suffix = path.suffix.lower()
+                if suffix in {".so", ".dylib", ".dll"}:
+                    name = path.name.lower()
+                    posix = f"/{rel.lower()}"
+                    if not (
+                        name.startswith("kimg_")
+                        or "/imageformats/" in posix
+                        or "/bin/" in posix
+                    ):
+                        continue
+                elif suffix not in {"", ".sh", ".py", ".pl", ".lua"}:
+                    continue
+                seen.add(rel)
+                candidates.append(rel)
                 if len(candidates) >= 6:
                     return candidates
         return candidates
@@ -1222,17 +1736,38 @@ class PocStage:
                 "source_url": recipe.source_url,
                 "source_title": recipe.source_title,
                 "recipe_type": recipe.recipe_type,
-                "steps": recipe.steps,
-                "repo_setup_commands": recipe.repo_setup_commands,
-                "build_commands": recipe.build_commands,
-                "artifact_generation_commands": recipe.artifact_generation_commands,
-                "run_commands": recipe.run_commands,
+                "steps": self._compact_recipe_commands(recipe.steps),
+                "repo_setup_commands": self._compact_recipe_commands(recipe.repo_setup_commands),
+                "build_commands": self._compact_recipe_commands(recipe.build_commands),
+                "artifact_generation_commands": self._compact_recipe_commands(recipe.artifact_generation_commands),
+                "run_commands": self._compact_recipe_commands(recipe.run_commands),
                 "expected_behavior": recipe.expected_behavior,
                 "source_excerpt": self._truncate_text(recipe.source_excerpt, self.REFERENCE_POC_SUMMARY_CHAR_LIMIT),
                 "confidence": recipe.confidence,
             }
             summaries.append(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True).strip())
         return summaries
+
+    def _compact_recipe_commands(self, commands: list[str], *, limit: int = 6, max_chars: int = 180) -> list[str]:
+        """Keep recipe command lists short so PoC LLM prompts stay within timeout budgets."""
+
+        compacted: list[str] = []
+        for command in commands[:limit]:
+            text = (command or "").strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if ("base64" in lowered or "printf '%s'" in lowered) and len(text) > max_chars:
+                compacted.append(
+                    self._truncate_text(
+                        text,
+                        max_chars,
+                    )
+                    + "  # large base64 payload omitted; use dataset/recipe blob bytes"
+                )
+            else:
+                compacted.append(self._truncate_text(text, max_chars * 2))
+        return compacted
 
     def _extract_patch_metadata(self, patch_diff_text: str) -> dict[str, list[str]]:
         changed_functions = sorted(set(re.findall(r"^@@ .*? ([A-Za-z_][A-Za-z0-9_]*)\s*\(", patch_diff_text, re.MULTILINE)))
@@ -1277,11 +1812,101 @@ class PocStage:
             for path in sorted(poc_dir.iterdir()):
                 if not path.is_file():
                     continue
-                content = path.read_text(encoding="utf-8", errors="replace")
-                summaries.append(
-                    f"FILE: {path.name}\nCONTENT:\n{self._truncate_text(content, self.REFERENCE_POC_CHAR_LIMIT)}"
-                )
+                raw = path.read_bytes()
+                if len(raw) > self.DATASET_POC_BYTE_LIMIT:
+                    summaries.append(
+                        f"FILE: {path.name}\nENCODING: omitted\nSIZE: {len(raw)}\nCONTENT:\n<payload too large; use dataset file bytes verbatim>"
+                    )
+                    continue
+                if self._looks_like_binary_payload(raw) or path.suffix.lower() in {
+                    ".bin",
+                    ".abc",
+                    ".dat",
+                    ".raw",
+                    ".xcf",
+                    ".psd",
+                    ".pcx",
+                    ".tga",
+                }:
+                    encoded = base64.b64encode(raw).decode("ascii")
+                    summaries.append(
+                        f"FILE: {path.name}\nENCODING: base64\nSIZE: {len(raw)}\nCONTENT:\n"
+                        f"{self._truncate_text(encoded, self.REFERENCE_POC_CHAR_LIMIT)}"
+                    )
+                else:
+                    content = raw.decode("utf-8", errors="replace")
+                    summaries.append(
+                        f"FILE: {path.name}\nENCODING: text\nCONTENT:\n{self._truncate_text(content, self.REFERENCE_POC_CHAR_LIMIT)}"
+                    )
         return summaries[: self.REFERENCE_POC_BLOCK_LIMIT]
+
+    def _collect_dataset_poc_payloads(self, cve_id: str) -> tuple[list[str], list[str]]:
+        """Return (filenames, base64 blobs) for authoritative dataset PoC payloads."""
+
+        filenames: list[str] = []
+        blobs: list[str] = []
+        seen: set[str] = set()
+        for prefix in ("Dataset", "source/Dataset"):
+            poc_dir = Path(prefix) / cve_id / "vuln_data" / "vuln_pocs"
+            if not poc_dir.exists():
+                continue
+            for path in sorted(poc_dir.iterdir()):
+                if not path.is_file() or path.name in seen:
+                    continue
+                raw = path.read_bytes()
+                if not raw or len(raw) > self.DATASET_POC_BYTE_LIMIT:
+                    continue
+                if path.suffix.lower() in {".zip", ".tar", ".tgz", ".gz", ".md", ".yaml", ".yml"}:
+                    continue
+                seen.add(path.name)
+                filenames.append(path.name)
+                blobs.append(base64.b64encode(raw).decode("ascii"))
+                if len(blobs) >= self.DATASET_POC_COUNT_LIMIT:
+                    break
+            if len(blobs) >= self.DATASET_POC_COUNT_LIMIT:
+                break
+        return self._order_dataset_poc_payloads(filenames, blobs)
+
+    @staticmethod
+    def _order_dataset_poc_payloads(filenames: list[str], blobs: list[str]) -> tuple[list[str], list[str]]:
+        """Rank dataset PoCs by evidence, not CVE id.
+
+        crafted_bpp*.xcf beats ClusterFuzz XCF corpora when both exist. Otherwise
+        OSS-Fuzz minimized seeds beat tiny harvested poc.* files: the latter often
+        only null-deref (SEGV) while the minimized testcase is the sanitizer hit.
+        """
+
+        if not filenames or not blobs or len(filenames) != len(blobs):
+            return filenames, blobs
+
+        has_crafted_bpp = any(re.search(r"crafted_bpp\d*\.xcf$", name.lower()) for name in filenames)
+
+        def rank(item: tuple[str, str]) -> tuple[int, int, str]:
+            name, blob = item
+            lowered = name.lower()
+            try:
+                size = len(base64.b64decode(blob))
+            except Exception:
+                size = 10**9
+            if re.search(r"crafted_bpp\d*\.xcf$", lowered):
+                return (0, size, lowered)
+            if "clusterfuzz" in lowered or "testcase-minimized" in lowered:
+                # Demote ClusterFuzz only when a crafted_bpp XCF seed is present.
+                return (2, size, lowered) if has_crafted_bpp else (0, size, lowered)
+            return (1, size, lowered)
+
+        ordered = sorted(zip(filenames, blobs), key=rank)
+        names, encoded = zip(*ordered)
+        return list(names), list(encoded)
+
+    def _looks_like_binary_payload(self, data: bytes) -> bool:
+        if not data:
+            return False
+        sample = data[:8192]
+        if b"\x00" in sample:
+            return True
+        nontext = sum(1 for byte in sample if byte < 9 or (13 < byte < 32) or byte == 127)
+        return (nontext / max(len(sample), 1)) > 0.30
 
     def _reference_poc_prompt_blocks(self, blocks: list[str], detailed: bool) -> list[str]:
         if detailed:
@@ -1344,16 +1969,80 @@ class PocStage:
         return not (raw_response or "").strip()
 
     def _select_target_binary(self, build: BuildArtifact, context: PocContext, payload_filename: str = "") -> str:
+        default = self._default_target_binary(build, context, payload_filename=payload_filename)
+        preferred = self._prefer_ossfuzz_harness_binary(
+            default_binary=default,
+            payload_filename=payload_filename,
+            build=build,
+            repo_url=context.repo_url,
+        )
+        return preferred
+
+    def _default_target_binary(self, build: BuildArtifact, context: PocContext, payload_filename: str = "") -> str:
         if build.binary_or_entrypoint:
-            return self._normalize_target_binary(build.binary_or_entrypoint, context.repo_url)
+            binary = self._normalize_target_binary(build.binary_or_entrypoint, context.repo_url)
+            binary = self._correct_nested_src_binary_path(binary, context.repo_url)
+            return self._rewrite_non_executable_or_qt_plugin_target(
+                binary, payload_filename, context.repo_url
+            )
         if build.expected_binary_path:
-            return self._normalize_target_binary(build.expected_binary_path, context.repo_url)
+            binary = self._normalize_target_binary(build.expected_binary_path, context.repo_url)
+            binary = self._correct_nested_src_binary_path(binary, context.repo_url)
+            return self._rewrite_non_executable_or_qt_plugin_target(
+                binary, payload_filename, context.repo_url
+            )
         interpreter = self._interpreter_for_payload(payload_filename)
         if interpreter:
             return interpreter
-        if context.candidate_entrypoints:
-            return self._normalize_target_binary(context.candidate_entrypoints[0], context.repo_url)
+        usable = [
+            item
+            for item in (context.candidate_entrypoints or [])
+            if item and not self._looks_like_non_executable_source(item)
+        ]
+        inferred = self._infer_qt_kimg_plugin_path(
+            payload_filename, context.repo_url, " ".join(usable)
+        )
+        if inferred:
+            return inferred
+        if usable:
+            binary = self._normalize_target_binary(usable[0], context.repo_url)
+            return self._correct_nested_src_binary_path(binary, context.repo_url)
+        # Gated: never invent ./target when an in-tree OSS-Fuzz harness is evidenced.
+        harness = ossfuzz_tools.parse_ossfuzz_harness_name(payload_filename)
+        repo_path = Path(build.repo_local_path) if build.repo_local_path else None
+        if harness and repo_path is not None and repo_path.is_dir():
+            if ossfuzz_tools.harness_source_evidence(repo_path, harness):
+                rel = ossfuzz_tools.preferred_harness_relpath(repo_path, harness) or harness
+                binary = self._normalize_target_binary(rel, context.repo_url)
+                return self._correct_nested_src_binary_path(binary, context.repo_url)
         return "./target"
+
+    def _prefer_ossfuzz_harness_binary(
+        self,
+        *,
+        default_binary: str,
+        payload_filename: str,
+        build: BuildArtifact,
+        repo_url: str,
+    ) -> str:
+        """Override target only when OSS-Fuzz harness name parses and in-tree evidence exists."""
+
+        harness = ossfuzz_tools.parse_ossfuzz_harness_name(payload_filename)
+        if not harness:
+            return default_binary
+        if Path(default_binary or "").name == harness:
+            return default_binary
+
+        repo_path = Path(build.repo_local_path) if build.repo_local_path else None
+        if repo_path is None or not repo_path.is_dir():
+            return default_binary
+        if not ossfuzz_tools.harness_source_evidence(repo_path, harness):
+            return default_binary
+        rel = ossfuzz_tools.preferred_harness_relpath(repo_path, harness)
+        if not rel:
+            return default_binary
+        binary = self._normalize_target_binary(rel, repo_url)
+        return self._correct_nested_src_binary_path(binary, repo_url)
 
     def _select_target_args(
         self,
@@ -1364,6 +2053,9 @@ class PocStage:
         recipe_run_command: str = "",
     ) -> list[str]:
         payload_path = f"/workspace/artifacts/poc/payloads/{payload_filename}"
+        # OSS-Fuzz / libFuzzer harnesses take the reproducer as argv, not shell stdin.
+        if self._looks_like_ossfuzz_harness(target_binary, payload_filename):
+            return [payload_path]
         if recipe_run_command:
             normalized_command = self._normalize_run_command(recipe_run_command, payload_filename, context.repo_url)
             parts = normalized_command.split()
@@ -1380,19 +2072,91 @@ class PocStage:
             return [f"< {payload_path}"]
         return [payload_path]
 
-    def _infer_trigger_mode(self, payload_filename: str, context: PocContext) -> str:
+    def _infer_trigger_mode(self, payload_filename: str, context: PocContext, target_binary: str = "") -> str:
         suffix = Path(payload_filename).suffix.lower()
         if suffix in {".sh", ".py", ".pl"}:
             return "script-driver"
+        if self._looks_like_ossfuzz_harness(target_binary, payload_filename):
+            return "cli-file"
         if "stdin" in context.inferred_input_modes:
             return "cli-stdin"
         if "argv" in context.inferred_input_modes:
             return "cli-argv"
         return "cli-file"
 
+    def _looks_like_ossfuzz_harness(self, target_binary: str = "", payload_filename: str = "") -> bool:
+        """Gate: ClusterFuzz/libFuzzer-style targets must receive the file as argv."""
+
+        binary_name = Path((target_binary or "").replace("\\", "/")).name.lower()
+        payload_name = Path((payload_filename or "").replace("\\", "/")).name.lower()
+        if "fuzzer" in binary_name or binary_name.endswith("_fuzz"):
+            return True
+        if payload_name.startswith("clusterfuzz-testcase") or "ossfuzz" in payload_name:
+            return True
+        return False
+
+    def _coerce_ossfuzz_harness_file_argv(self, plan: PocPlan) -> PocPlan:
+        """Rewrite stdin-style ``< path`` args for fuzzer harnesses into file argv.
+
+        ``_shell_quote('< /path')`` turns the redirect into a literal filename and
+        the harness fails with ``open < /path: No such file``.
+        """
+
+        if not self._looks_like_ossfuzz_harness(plan.target_binary, plan.payload_filename):
+            # Still fix quoted stdin redirects in run_command for non-fuzzers via
+            # _build_run_command when we rebuild; leave plan unless args look broken.
+            return self._rebuild_run_command_if_stdin_redirect_quoted(plan)
+
+        payload_path = f"/workspace/artifacts/poc/payloads/{plan.payload_filename}"
+        cleaned: list[str] = []
+        for arg in plan.target_args or []:
+            text = (arg or "").strip().strip("'\"")
+            match = re.match(r"^<\s*(.+)$", text)
+            if match:
+                path = match.group(1).strip().strip("'\"")
+                cleaned.append(path or payload_path)
+                continue
+            cleaned.append(arg)
+        if not cleaned:
+            cleaned = [payload_path]
+        elif not any(
+            payload_path == item
+            or item.endswith(f"/{plan.payload_filename}")
+            or Path(item).name == plan.payload_filename
+            for item in cleaned
+        ):
+            cleaned = [payload_path] + cleaned
+
+        plan.target_args = cleaned
+        if plan.trigger_mode == "cli-stdin":
+            plan.trigger_mode = "cli-file"
+        plan.run_command = self._build_run_command(plan.target_binary, plan.target_args)
+        return plan
+
+    def _rebuild_run_command_if_stdin_redirect_quoted(self, plan: PocPlan) -> PocPlan:
+        """Unquote accidental ``'< /path'`` tokens that break real shell redirects."""
+
+        command = plan.run_command or ""
+        if "'<" not in command and '"<' not in command:
+            # Also rebuild when target_args still encode a redirect token.
+            if any(re.match(r"^<\s*\S", (arg or "").strip()) for arg in (plan.target_args or [])):
+                plan.run_command = self._build_run_command(plan.target_binary, plan.target_args)
+            return plan
+        plan.run_command = self._build_run_command(plan.target_binary, plan.target_args)
+        return plan
+
     def _build_run_command(self, target_binary: str, target_args: list[str]) -> str:
         segments = [self._shell_quote(target_binary)]
-        segments.extend(self._shell_quote(item) for item in target_args)
+        for item in target_args or []:
+            text = (item or "").strip()
+            # Keep shell redirect operators out of quoted argv tokens.
+            match = re.match(r"^<\s*(.+)$", text)
+            if match:
+                path = match.group(1).strip().strip("'\"")
+                segments.append("<")
+                segments.append(self._shell_quote(path))
+                continue
+            segments.append(self._shell_quote(item))
         return " ".join(item for item in segments if item).strip()
 
     def _normalize_recipe_run_command(self, run_command: str, payload_filename: str) -> str:
@@ -1434,7 +2198,7 @@ class PocStage:
                 safe_name = safe_name.lstrip("/")
             if not safe_name:
                 continue
-            normalized[safe_name] = content
+            normalized[safe_name] = self._maybe_decode_base64_payload(content)
         return normalized
 
     def _normalize_workspace_arg(self, arg: str, payload_filename: str) -> str:
@@ -1453,6 +2217,39 @@ class PocStage:
             .replace("./payloads/", "/workspace/artifacts/poc/payloads/")
             .replace("/workspace/repo/", f"{project_dir}/")
         )
+
+    def _strip_pre_run_make_rebuild(self, run_command: str) -> str:
+        """Drop `make` segments chained before the actual trigger.
+
+        Recipes often prepend `make -C <subdir>` before running the binary. That
+        rebuilds the default `all` target (man pages / xmlto) without the build
+        stage's ASan flags and fails before the sanitizer trigger can run.
+        Prefer the already-built binary from the build stage.
+        """
+        stripped = (run_command or "").strip()
+        if not stripped or "&&" not in stripped:
+            return run_command
+
+        parts = [part.strip() for part in re.split(r"\s*&&\s*", stripped) if part.strip()]
+        if len(parts) < 2:
+            return run_command
+
+        def _is_make_rebuild(part: str) -> bool:
+            remainder = part.strip()
+            while True:
+                match = re.match(
+                    r"""^[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|[^\s]+)\s+""",
+                    remainder,
+                )
+                if not match:
+                    break
+                remainder = remainder[match.end() :]
+            return bool(re.match(r"^(?:g?make)\b", remainder))
+
+        kept = [part for part in parts if not _is_make_rebuild(part)]
+        if not kept or kept == parts:
+            return run_command
+        return " && ".join(kept)
 
     def _align_run_command_with_target_binary(self, run_command: str, target_binary: str) -> str:
         stripped = (run_command or "").strip()
@@ -1488,6 +2285,560 @@ class PocStage:
         project_dir = self._container_project_dir(repo_url)
         cleaned = target_binary[2:] if target_binary.startswith("./") else target_binary
         return f"{project_dir}/{cleaned}".replace("//", "/")
+
+    def _correct_nested_src_binary_path(self, target_binary: str, repo_url: str) -> str:
+        """Collapse mistaken `/src/<proj>/src/<proj>` paths to `/src/<proj>/<proj>`."""
+
+        if not target_binary or not repo_url:
+            return target_binary
+        project_dir = self._container_project_dir(repo_url)
+        project_name = self._derive_project_name(repo_url)
+        nested = f"{project_dir}/src/{project_name}"
+        if target_binary == nested:
+            return f"{project_dir}/{project_name}"
+        return target_binary
+
+    def _looks_like_shared_library(self, path: str) -> bool:
+        lowered = (path or "").lower().replace("\\", "/")
+        return bool(re.search(r"\.(so|dylib|dll)(\b|$)", lowered))
+
+    _NON_EXECUTABLE_NAMES: frozenset[str] = frozenset(
+        {
+            "authors",
+            "copying",
+            "license",
+            "licence",
+            "changelog",
+            "changes",
+            "news",
+            "install",
+            "readme",
+            "todo",
+            "credits",
+            "maintainers",
+            "cmakelists.txt",
+            "makefile",
+            "makefile.am",
+            "makefile.in",
+        }
+    )
+    _NON_EXECUTABLE_SUFFIXES: frozenset[str] = frozenset(
+        {".md", ".rst", ".txt", ".html", ".in", ".cmake", ".h", ".hpp", ".c", ".cc", ".cpp", ".cxx"}
+    )
+    _QT_KIMG_FORMATS: frozenset[str] = frozenset(
+        {"xcf", "psd", "tga", "pcx", "ras", "rgb", "pic", "hdr", "ora", "kra", "eps", "exr"}
+    )
+
+    def _looks_like_non_executable_source(self, path: str) -> bool:
+        """True for docs/source files that must never be executed as a PoC target."""
+
+        name = Path((path or "").replace("\\", "/")).name.lower()
+        if not name:
+            return False
+        stem = name.split(".", 1)[0]
+        if name in self._NON_EXECUTABLE_NAMES or stem in self._NON_EXECUTABLE_NAMES:
+            return True
+        if name.startswith("readme") or name.startswith("copying") or name.startswith("license"):
+            return True
+        suffix = Path(name).suffix.lower()
+        return suffix in self._NON_EXECUTABLE_SUFFIXES
+
+    def _looks_like_imageformats_source_file(self, path: str) -> bool:
+        cleaned = (path or "").replace("\\", "/").lower()
+        if "/imageformats/" not in cleaned:
+            return False
+        return not self._looks_like_shared_library(cleaned)
+
+    def _infer_qt_kimg_plugin_path(
+        self,
+        payload_filename: str,
+        repo_url: str = "",
+        current_target: str = "",
+    ) -> str:
+        """Map an image payload suffix to build/bin/imageformats/kimg_<fmt>.so when gated."""
+
+        suffix = Path(payload_filename or "").suffix.lower().lstrip(".")
+        if suffix not in self._QT_KIMG_FORMATS:
+            return ""
+        marker = f"{current_target} {repo_url}".lower().replace("\\", "/")
+        if not any(token in marker for token in ("imageformats", "kimageformats", "kimg_")):
+            return ""
+        project_dir = ""
+        if repo_url:
+            project_dir = self._container_project_dir(repo_url)
+        if not project_dir:
+            match = re.search(r"(/src/[^/]+)/", (current_target or "").replace("\\", "/"))
+            project_dir = match.group(1) if match else ""
+        if not project_dir:
+            return ""
+        return f"{project_dir}/build/bin/imageformats/kimg_{suffix}.so"
+
+    def _rewrite_non_executable_or_qt_plugin_target(
+        self,
+        target_binary: str,
+        payload_filename: str,
+        repo_url: str = "",
+    ) -> str:
+        """Replace docs/source-tree files with the Qt image plugin inferred from the payload."""
+
+        inferred = self._infer_qt_kimg_plugin_path(payload_filename, repo_url, target_binary)
+        if not inferred:
+            return target_binary
+        if (
+            not target_binary
+            or self._looks_like_non_executable_source(target_binary)
+            or self._looks_like_imageformats_source_file(target_binary)
+        ):
+            return inferred
+        return target_binary
+
+    def _correct_qt_plugin_binary_path(self, target_binary: str) -> str:
+        """Rewrite mistaken Qt image-plugin paths to build/bin/imageformats/.
+
+        Common LLM mistakes:
+        - build/src/imageformats/kimg_*.so  (source tree, not install/build output)
+        - build/bin/kimg_*.so               (missing imageformats/ subdirectory)
+        """
+
+        if not target_binary:
+            return target_binary
+        cleaned = target_binary.replace("\\", "/")
+        cleaned = re.sub(
+            r"(/build)/src/imageformats/(kimg_[^/]+\.so)\b",
+            r"\1/bin/imageformats/\2",
+            cleaned,
+        )
+        # Only rewrite bare build/bin/kimg_*.so — not paths that already include imageformats/.
+        cleaned = re.sub(
+            r"(/build/bin)/(?!imageformats/)(kimg_[^/]+\.so)\b",
+            r"\1/imageformats/\2",
+            cleaned,
+        )
+        return cleaned
+
+    def _prefer_compact_dataset_xcf_payload(
+        self,
+        plan: PocPlan,
+        dataset_poc_filenames: Optional[list[str]] = None,
+        dataset_poc_base64_blobs: Optional[list[str]] = None,
+    ) -> PocPlan:
+        """Prefer small crafted XCF PoCs over huge ClusterFuzz corpora when both exist.
+
+        CVE-2021-36083-style XCF overflows are reproduced by crafted_bpp*.xcf; the
+        large minimized ClusterFuzz seed often only yields ASan DEADLYSIGNAL storms
+        without a matchable stack-buffer-overflow report.
+        """
+
+        filenames = list(dataset_poc_filenames or [])
+        blobs = list(dataset_poc_base64_blobs or [])
+        if not filenames or not blobs or len(filenames) != len(blobs):
+            return plan
+
+        preferred_idx = None
+        for idx, name in enumerate(filenames):
+            if re.search(r"crafted_bpp\d*\.xcf$", name.lower()):
+                preferred_idx = idx
+                break
+        if preferred_idx is None:
+            return plan
+
+        current = (plan.payload_filename or "").lower()
+        if re.search(r"crafted_bpp\d*\.xcf$", current):
+            return plan
+
+        current_size = len((plan.payload_content or "").encode("latin-1", errors="replace"))
+        should_switch = (
+            "clusterfuzz" in current
+            or "testcase-minimized" in current
+            or current_size >= 4096
+            or not current.endswith(".xcf")
+            or current in {"poc.txt", "poc.bin", "trigger", "payload"}
+        )
+        if not should_switch:
+            return plan
+
+        name = filenames[preferred_idx]
+        raw = base64.b64decode(blobs[preferred_idx])
+        plan.payload_filename = Path(name).name
+        plan.payload_content = raw.decode("latin-1", errors="replace")
+        if not plan.source_of_truth or plan.source_of_truth in {"llm_synthesized", "dataset_poc"}:
+            plan.source_of_truth = "dataset_poc"
+        return plan
+
+    def _prefer_ossfuzz_minimized_payload(
+        self,
+        plan: PocPlan,
+        dataset_poc_filenames: Optional[list[str]] = None,
+        dataset_poc_base64_blobs: Optional[list[str]] = None,
+    ) -> PocPlan:
+        """Prefer OSS-Fuzz minimized seeds over tiny harvested poc.* files.
+
+        GitHub commit pages often embed a short poc.cil that only hits a null
+        SEGV. The ClusterFuzz minimized testcase is the actual sanitizer
+        reproducer. Do not override crafted_bpp*.xcf.
+        """
+
+        filenames = list(dataset_poc_filenames or [])
+        blobs = list(dataset_poc_base64_blobs or [])
+        if not filenames or not blobs or len(filenames) != len(blobs):
+            return plan
+        if any(re.search(r"crafted_bpp\d*\.xcf$", name.lower()) for name in filenames):
+            return plan
+
+        preferred_idx = None
+        for idx, name in enumerate(filenames):
+            lowered = name.lower()
+            if "clusterfuzz" in lowered or "testcase-minimized" in lowered:
+                preferred_idx = idx
+                break
+        if preferred_idx is None:
+            return plan
+
+        current = Path(plan.payload_filename or "").name.lower()
+        if "clusterfuzz" in current or "testcase-minimized" in current:
+            return plan
+        generic_names = {"poc.cil", "poc.txt", "poc.bin", "poc", "trigger", "payload", "poc.c"}
+        if current not in generic_names and not re.fullmatch(r"poc\.[a-z0-9]+", current):
+            return plan
+
+        name = filenames[preferred_idx]
+        raw = base64.b64decode(blobs[preferred_idx])
+        plan.payload_filename = Path(name).name
+        plan.payload_content = raw.decode("latin-1", errors="replace")
+        if not plan.source_of_truth or plan.source_of_truth in {"llm_synthesized", "dataset_poc"}:
+            plan.source_of_truth = "dataset_poc"
+        return plan
+
+    def _sync_payload_filename_into_command(self, plan: PocPlan) -> PocPlan:
+        filename = Path(plan.payload_filename or "").name
+        if not filename:
+            return plan
+        payload_path = f"/workspace/artifacts/poc/payloads/{filename}"
+        plan.target_args = [
+            re.sub(r"/workspace/artifacts/poc/payloads/[^/\s'\"]+", payload_path, arg)
+            if "/workspace/artifacts/poc/payloads/" in arg
+            else self._normalize_workspace_arg(arg, filename)
+            for arg in (plan.target_args or [])
+        ]
+        if plan.run_command:
+            plan.run_command = re.sub(
+                r"/workspace/artifacts/poc/payloads/[^/\s'\"]+",
+                payload_path,
+                plan.run_command,
+            )
+            plan.run_command = self._normalize_run_command(plan.run_command, filename)
+        return plan
+
+    def _qt_plugin_search_path(self, plugin_so_path: str) -> str:
+        cleaned = (plugin_so_path or "").replace("\\", "/")
+        if "/imageformats/" in cleaned:
+            return cleaned.rsplit("/imageformats/", 1)[0]
+        from pathlib import PurePosixPath
+
+        return str(PurePosixPath(cleaned).parent) if cleaned else "/tmp"
+
+    def _image_format_hint(self, payload_filename: str, plugin_so_path: str) -> str:
+        suffix = Path(payload_filename or "").suffix.lower().lstrip(".")
+        if suffix:
+            return suffix
+        match = re.search(r"kimg_([a-z0-9]+)\.so\b", (plugin_so_path or "").lower())
+        if match:
+            return match.group(1)
+        return ""
+
+    def _qimage_harness_source(self) -> str:
+        return """#include <cstdio>
+#include <cstdlib>
+
+#include <QCoreApplication>
+#include <QImage>
+#include <QImageReader>
+#include <QString>
+
+int main(int argc, char **argv)
+{
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: %s <image> [format]\\n", argv[0]);
+        return 2;
+    }
+
+    QCoreApplication app(argc, argv);
+    if (const char *plugin_path = std::getenv("QT_PLUGIN_PATH")) {
+        if (*plugin_path) {
+            QCoreApplication::addLibraryPath(QString::fromLocal8Bit(plugin_path));
+        }
+    }
+
+    QImageReader reader(QString::fromLocal8Bit(argv[1]));
+    if (argc >= 3 && argv[2] && *argv[2]) {
+        reader.setFormat(argv[2]);
+    }
+
+    const QImage image = reader.read();
+    if (image.isNull()) {
+        std::fprintf(stderr, "read failed: %s\\n", qPrintable(reader.errorString()));
+        return 1;
+    }
+
+    std::fprintf(stderr, "read ok: %dx%d\\n", image.width(), image.height());
+    return 0;
+}
+"""
+
+    def _ensure_shared_library_harness(self, plan: PocPlan) -> PocPlan:
+        """Rewrite plans that try to execute a shared library/plugin into a loader harness.
+
+        Qt image plugins (kimg_*.so) and other .so targets are not executables. Directly
+        invoking them yields exit 127 and never reaches the vulnerable parser path.
+        """
+
+        plugin_path = plan.target_binary or ""
+        if not self._looks_like_shared_library(plugin_path):
+            match = re.search(r"(/src/[^\s'\"]+\.so)\b", plan.run_command or "")
+            if not match:
+                match = re.search(r"((?:build/)?[^\s'\"]+\.so)\b", plan.run_command or "")
+            if not match:
+                return plan
+            plugin_path = match.group(1)
+            if not plugin_path.startswith("/"):
+                # Best-effort: leave relative; normalize later only if already absolute.
+                pass
+            plugin_path = self._correct_qt_plugin_binary_path(plugin_path)
+            plan.target_binary = plugin_path
+
+        if not self._looks_like_shared_library(plan.target_binary):
+            return plan
+
+        plan.target_binary = self._correct_qt_plugin_binary_path(plan.target_binary)
+        plugin_path = plan.target_binary
+        payload_path = f"/workspace/artifacts/poc/payloads/{plan.payload_filename}"
+        fmt = self._image_format_hint(plan.payload_filename, plugin_path)
+        plugin_root = self._qt_plugin_search_path(plugin_path)
+
+        harness_rel = "inputs/qimage_harness.cpp"
+        auxiliaries = dict(plan.auxiliary_files or {})
+        auxiliaries[harness_rel] = self._qimage_harness_source()
+        plan.auxiliary_files = auxiliaries
+
+        harness_src = f"/workspace/artifacts/poc/{harness_rel}"
+        harness_bin = "/tmp/qimage_harness"
+        # Gate: library-harness loader stays unsanitized. The Qt plugin is already
+        # built with -shared-libasan; compiling the tiny QImage loader the same
+        # way double-inits ASan across unsanitized system Qt and yields SIGILL /
+        # nested DEADLYSIGNAL. Preload the runtime onto the unsanitized loader
+        # so dlopen(plugin) still sees ASan first (LLVM's DSO-only model).
+        # Do not export LD_PRELOAD around clang++/timeout.
+        compile_cmd = (
+            "clang++ -g -O0 -fno-omit-frame-pointer "
+            f"{self._shell_quote(harness_src)} -o {self._shell_quote(harness_bin)} "
+            "$(pkg-config --cflags --libs Qt5Gui Qt5Core)"
+        )
+        asan_options = (
+            "abort_on_error=1:halt_on_error=1:symbolize=1:detect_leaks=0:"
+            "alloc_dealloc_mismatch=0:fast_unwind_on_fatal=0"
+        )
+        asan_rt_setup = (
+            "_ASAN_RT=; "
+            "for _asan_dir in /usr/lib/llvm-*/lib/clang/*/lib/linux /usr/lib/clang/*/lib/linux; do "
+            'if [[ -f "${_asan_dir}/libclang_rt.asan-x86_64.so" ]]; then '
+            'export LD_LIBRARY_PATH="${_asan_dir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; '
+            '_ASAN_RT="${_asan_dir}/libclang_rt.asan-x86_64.so"; '
+            "break; "
+            "fi; "
+            "done"
+        )
+        fmt_arg = f" {self._shell_quote(fmt)}" if fmt else ""
+        plan.trigger_mode = "library-harness"
+        plan.run_command = (
+            f"export QT_PLUGIN_PATH={self._shell_quote(plugin_root)} "
+            f"ASAN_OPTIONS={self._shell_quote(asan_options)}; "
+            f"{asan_rt_setup}; "
+            f"{compile_cmd} && "
+            f"timeout 90s env LD_PRELOAD="
+            '"${_ASAN_RT}" '
+            f"{self._shell_quote(harness_bin)} "
+            f"{self._shell_quote(payload_path)}{fmt_arg}"
+        )
+        env = dict(plan.environment_variables or {})
+        env["QT_PLUGIN_PATH"] = plugin_root
+        env["ASAN_OPTIONS"] = asan_options
+        plan.environment_variables = env
+        note = "Normalized shared-library/plugin target into QImage harness (do not exec .so)."
+        if note not in (plan.rationale or ""):
+            plan.rationale = f"{(plan.rationale or '').rstrip()} {note}".strip()
+        return plan
+
+    def _rewrite_nested_src_binary_in_command(self, run_command: str, repo_url: str) -> str:
+        """Rewrite mistaken nested `src/<proj>` binary references in run commands."""
+
+        if not run_command or not repo_url:
+            return run_command
+        project_name = self._derive_project_name(repo_url)
+        project_dir = self._container_project_dir(repo_url)
+        corrected = f"{project_dir}/{project_name}"
+        patterns = [
+            rf"(?<!\S){re.escape(project_dir)}/src/{re.escape(project_name)}(?!\S)",
+            rf"(?<!\S)\./src/{re.escape(project_name)}(?!\S)",
+            rf"(?<!\S)src/{re.escape(project_name)}(?!\S)",
+        ]
+        rewritten = run_command
+        for pattern in patterns:
+            rewritten = re.sub(pattern, corrected, rewritten)
+        return rewritten
+
+    def _maybe_decode_base64_payload(self, content: str) -> str:
+        """Decode single-blob base64 payloads commonly copied from reproduction recipes."""
+
+        decoded = self._decode_base64_blob(content)
+        if decoded is None:
+            return content
+        return decoded if decoded.endswith("\n") else f"{decoded}\n"
+
+    def _unwrap_nested_base64_payload(self, content: str) -> str:
+        """Unwrap a second base64 layer when the file stores recipe ``base64 -d`` input.
+
+        Transport decoding of ``dataset_poc_base64_blobs`` yields the on-disk
+        file bytes. Some harvested PoCs keep those bytes as ASCII base64 of a
+        script (``echo -n '...' | base64 -d > poc``). Only unwrap when the
+        inner decode looks like source (script markers); binary seeds and
+        already-decoded scripts are unchanged.
+        """
+
+        decoded = self._decode_base64_blob(content)
+        if decoded is None:
+            return content
+        markers = (
+            "function",
+            "local ",
+            "#!/",
+            "import ",
+            "#include",
+            "print(",
+            "return ",
+            "<const>",
+        )
+        if not any(marker in decoded for marker in markers):
+            return content
+        return decoded if decoded.endswith("\n") else f"{decoded}\n"
+
+    def _resolve_payload_content(self, content: str, recipe_base64_blobs: list[str]) -> str:
+        """Prefer recipe/dataset base64 bytes when LLM text mangled or invented content."""
+
+        recipe_decoded: Optional[str] = None
+        for blob in recipe_base64_blobs:
+            recipe_decoded = self._decode_base64_blob(blob)
+            if recipe_decoded is not None:
+                break
+
+        content_decoded = self._decode_base64_blob(content)
+        if content_decoded is not None:
+            # Content itself is still base64 — decode it, but recipe wins on mismatch.
+            if recipe_decoded is not None and self._should_prefer_recipe_payload(content_decoded, recipe_decoded):
+                chosen = recipe_decoded
+            else:
+                chosen = content_decoded
+        elif recipe_decoded is not None and self._should_prefer_recipe_payload(content, recipe_decoded):
+            chosen = recipe_decoded
+        else:
+            chosen = content
+
+        if recipe_decoded is not None and (
+            not (chosen or "").strip()
+            or chosen.strip() in {"trigger", "poc", "payload"}
+            or len(chosen) > max(self.MAX_SYNTHESIZED_PAYLOAD_CHARS, len(recipe_decoded) * 2)
+        ):
+            chosen = recipe_decoded
+
+        if recipe_decoded is None and len(chosen or "") > self.MAX_SYNTHESIZED_PAYLOAD_CHARS:
+            chosen = chosen[: self.MAX_SYNTHESIZED_PAYLOAD_CHARS]
+
+        chosen = chosen if chosen.endswith("\n") else f"{chosen}\n"
+        # Same nested unwrap as authoritative dataset_poc: file/recipe may still
+        # be the ``echo | base64 -d`` input rather than the final script bytes.
+        return self._unwrap_nested_base64_payload(chosen)
+
+    def _payload_matches_blob(self, content: str, blobs: list[str]) -> bool:
+        decoded_content = content[:-1] if content.endswith("\n") else content
+        for blob in blobs:
+            recipe_decoded = self._decode_base64_blob(blob)
+            if recipe_decoded is None:
+                continue
+            if decoded_content == recipe_decoded or decoded_content == recipe_decoded.rstrip("\n"):
+                return True
+        return False
+
+    def _decode_base64_blob(self, content: str) -> Optional[str]:
+        """Return latin-1 text for a pure base64 blob, else None."""
+
+        raw = content or ""
+        candidate = re.sub(r"\s+", "", raw.strip())
+        if len(candidate) < 16 or len(candidate) % 4 != 0:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9+/]+=*", candidate):
+            return None
+        try:
+            decoded = base64.b64decode(candidate, validate=True)
+        except binascii.Error:
+            return None
+        text = decoded.decode("latin-1")
+        markers = ("function", "local ", "#!/", "import ", "#include", "print(", "return ", "<const>")
+        if not any(marker in text for marker in markers) and "\n" not in text:
+            # Avoid treating short random tokens as payloads.
+            # Binary PoCs often lack newlines/markers — allow larger blobs.
+            if len(candidate) < 48:
+                return None
+        return text
+
+    def _should_prefer_recipe_payload(self, content: str, recipe_decoded: str) -> bool:
+        """True when content is missing control bytes present in the recipe decode."""
+
+        if not content.strip() or content.strip() in {"trigger", "poc", "payload"}:
+            return True
+        if len(content) > max(self.MAX_SYNTHESIZED_PAYLOAD_CHARS, len(recipe_decoded) * 2):
+            return True
+        if self._decode_base64_blob(content) is not None:
+            # Caller already compared decoded forms; prefer recipe if they diverge on controls.
+            pass
+
+        def control_bytes(text: str) -> set[str]:
+            return {ch for ch in text if ord(ch) < 32 and ch not in "\n\t\r"}
+
+        recipe_controls = control_bytes(recipe_decoded)
+        content_controls = control_bytes(content)
+        if recipe_controls - content_controls:
+            printable_content = "".join(ch for ch in content if ch.isprintable() or ch in "\n\t")
+            printable_recipe = "".join(ch for ch in recipe_decoded if ch.isprintable() or ch in "\n\t")
+            # Same skeleton, or LLM introduced backslash-letter stand-ins for controls.
+            if (
+                printable_content.replace(" ", "") == printable_recipe.replace(" ", "")
+                or printable_recipe[:40] in printable_content
+                or printable_content[:40] in printable_recipe
+                or re.search(r"(?<!\\)\\[a-zA-Z]", content) is not None
+            ):
+                return True
+        recipe_is_binary = any(ord(ch) < 32 and ch not in "\n\t\r" for ch in recipe_decoded) or "\x00" in recipe_decoded
+        if recipe_is_binary and abs(len(content) - len(recipe_decoded)) > max(64, len(recipe_decoded) // 4):
+            return True
+        return False
+
+    def _extract_recipe_base64_blobs(self, recipes: list[ReproductionRecipe]) -> list[str]:
+        """Pull base64 blobs out of recipe steps / artifact commands / excerpts."""
+
+        blob_re = re.compile(r"(?<![A-Za-z0-9+/])([A-Za-z0-9+/]{24,}={0,2})(?![A-Za-z0-9+/])")
+        blobs: list[str] = []
+        for recipe in recipes:
+            texts: list[str] = []
+            texts.extend(recipe.steps or [])
+            texts.extend(recipe.artifact_generation_commands or [])
+            texts.append(recipe.source_excerpt or "")
+            for text in texts:
+                for match in blob_re.finditer(text or ""):
+                    candidate = match.group(1)
+                    if self._decode_base64_blob(candidate) is None:
+                        continue
+                    if candidate not in blobs:
+                        blobs.append(candidate)
+        return blobs
 
     def _render_template(self, template_name: str, context: dict[str, Any]) -> str:
         if Environment is not None and FileSystemLoader is not None and StrictUndefined is not None:
@@ -1547,9 +2898,13 @@ class PocStage:
         )
 
     def _default_execution_dir(self, target_binary: str) -> str:
+        # Container paths are always POSIX; Path() on Windows would rewrite
+        # "/src/lua/lua" into "\src\lua" and break Docker execution.
+        from pathlib import PurePosixPath
+
         target = (target_binary or "").strip()
         if target.startswith("/"):
-            parent = str(Path(target).parent)
+            parent = str(PurePosixPath(target).parent)
             return parent or "/workspace"
         return "/workspace"
 
@@ -1641,6 +2996,13 @@ class PocStage:
 
         signal_exit_observed = exit_code_observed in {134, 139}
 
+        expected_signal_texts = list(plan.expected_stderr_patterns or [])
+        if plan.expected_crash_type:
+            expected_signal_texts.append(plan.expected_crash_type)
+        specific_error_hits = filter_hits_for_specific_sanitizer(
+            error_pattern_hits, expected_signal_texts
+        )
+
         # 3.9 eligible_for_verify
         eligible_for_verify = False
         eligibility_reason = ""
@@ -1650,13 +3012,25 @@ class PocStage:
             eligibility_reason = "log_not_well_formed: stdout/stderr block markers missing"
         else:
             # Priority: stderr > stdout > stack > crash_type > exit_code
-            if error_pattern_hits:
+            haystack = "\n".join(
+                [
+                    str(observation.get("observed_stderr") or ""),
+                    str(observation.get("observed_stdout") or ""),
+                    execution_logs or "",
+                ]
+            )
+            if specific_error_hits:
                 eligible_for_verify = True
-                eligibility_reason = f"error_pattern_hit: {error_pattern_hits[0]}"
+                eligibility_reason = f"error_pattern_hit: {specific_error_hits[0]}"
+            elif haystack_has_specific_sanitizer_bug(haystack, expected_signal_texts):
+                eligible_for_verify = True
+                eligibility_reason = "specific_sanitizer_bug_in_haystack"
             elif stdout_pattern_hits:
                 eligible_for_verify = True
                 eligibility_reason = f"stdout_pattern_hit: {stdout_pattern_hits[0]}"
-            elif stack_keyword_hits:
+            elif stack_keyword_hits and not specific_sanitizer_bugs_in(expected_signal_texts):
+                # Function names in library DIAG traces must not stand in for a
+                # concrete sanitizer report when the plan asked for one.
                 eligible_for_verify = True
                 eligibility_reason = f"stack_keyword_hit: {stack_keyword_hits[0]}"
             elif crash_type_compatible is True:
@@ -1706,13 +3080,34 @@ class PocStage:
             return "docker_build"
         if "container_run_success=False" in execution_logs:
             return "container_run"
+        lowered = (execution_logs or "").lower()
+        payload_invalid_markers = (
+            "invalid syntax",
+            "failed to compile",
+            "syntax error",
+            "parse error",
+            "parsing error",
+            "bad classpermission",
+            "unexpected token",
+            "unexpected end",
+            "unknown keyword",
+            "not a valid",
+            "malformed",
+            "yaml: ",
+            "json.decode",
+            "json.decoder",
+            "expaterror",
+            "xml.parsers",
+        )
+        if any(marker in lowered for marker in payload_invalid_markers):
+            return "payload_invalid"
         return "non_triggering"
 
     def _shell_quote(self, value: str) -> str:
         return "'" + value.replace("'", "'\"'\"'") + "'"
 
     def _escape_for_echo(self, value: str) -> str:
-        return value.replace("\\", "\\\\").replace('"', '\\"')
+        return value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
 
 
 def poc_node(state):

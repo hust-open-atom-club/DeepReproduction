@@ -1,0 +1,10 @@
+{# Clear _ASAN_RT when the target already DT_NEEDs libclang_rt.asan.
+   -shared-libasan binaries load ASan via the dynamic linker; LD_PRELOAD'ing
+   the same runtime again recurses into AddressSanitizer:DEADLYSIGNAL storms
+   (observed on instrumented CLI binaries such as lua). Keep LD_LIBRARY_PATH
+   so the .so still resolves; only skip the redundant preload. #}
+if [[ -n "${_ASAN_RT}" && -n "{{ target_binary }}" && -e "{{ target_binary }}" ]] && command -v ldd >/dev/null 2>&1; then
+  if ldd "{{ target_binary }}" 2>/dev/null | grep -q 'libclang_rt\.asan'; then
+    _ASAN_RT=""
+  fi
+fi

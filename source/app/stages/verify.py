@@ -6,6 +6,7 @@
 - 两次独立的 docker run --rm，环境变量 PATCH_MODE=pre|post
 - pre 模式：git reset --hard && bash build.sh && trigger
 - post 模式：git reset --hard && git apply patch.diff && bash build.sh && trigger
+  （若 build 注入了脆弱依赖前缀如 HDF5 1.12.0：跳过 in-tree patch，post 重建改链固定依赖）
 - 两次执行的日志契约与 PoC 一致（target_binary= / execution_exit_code= / stdout_begin/end 等）
 """
 
@@ -30,14 +31,19 @@ from app.schemas.build_artifact import BuildArtifact
 from app.schemas.knowledge import KnowledgeModel
 from app.schemas.poc_artifact import PoCArtifact
 from app.schemas.verify_result import VerifyResult
+from app.stages.asan_hardening import ensure_no_pie_for_asan
+from app.stages.build import BuildStage
 from app.tools.docker_tools import DockerRunRequest, DockerTool
 from app.tools.file_tools import FileTool
 from app.tools.log_parsing import (
     extract_block,
     extract_execution_observation,
+    haystack_has_specific_sanitizer_bug,
     match_patterns,
+    should_outer_asan_preload,
+    specific_sanitizer_bugs_in,
 )
-from app.tools.patch_tools import find_patch_diff
+from app.tools.patch_tools import find_patch_diff, strip_unapplyable_binary_stub_hunks
 from app.tools.process_tools import ProcessTool
 
 
@@ -97,6 +103,17 @@ class VerifyContext(BaseModel):
         default_factory=dict,
         description="PoC 持久化的环境变量；verify 必须复用",
     )
+    trigger_mode: str = Field(
+        default="",
+        description="PoC trigger mode; library-harness skips outer ASan LD_PRELOAD.",
+    )
+    dependency_fix_vulnerable_hdf5: bool = Field(
+        default=False,
+        description=(
+            "True when build.sh gated vulnerable HDF5 (/opt/hdf5-vuln). "
+            "Post-pass skips in-tree patch.diff and rebuilds against fixed HDF5 1.12.1."
+        ),
+    )
 
 
 class VerifyPlan(BaseModel):
@@ -114,6 +131,7 @@ class VerifyPlan(BaseModel):
     patch_apply_command: str = "git apply /workspace/artifacts/verify/patch.diff"
     repo_reset_command: str = "git reset --hard && git clean -fd"
     rebuild_command: str = "bash /workspace/artifacts/build/build.sh"
+    post_rebuild_command: str = "bash /workspace/artifacts/build/build.sh"
     pre_log_path: str
     post_log_path: str
 
@@ -151,16 +169,48 @@ class VerifyPlanner:
         self.stage = stage
 
     def plan(self, context: VerifyContext, paths: VerifyStagePaths) -> VerifyPlan:
+        rebuild = f"bash {context.build_script_in_image}"
+        post_rebuild = rebuild
+        patch_apply = "git apply /workspace/artifacts/verify/patch.diff"
+        if context.dependency_fix_vulnerable_hdf5:
+            # Dependency CVE: authoritative fix is swapping HDF5 1.12.0 -> 1.12.1.
+            # In-tree advisory YAML / docs patches must not gate post cleanliness.
+            patch_apply = (
+                "echo '[verify] deeprepro:dependency-fix skip in-tree patch "
+                "(vulnerable HDF5 gate)' && true"
+            )
+            post_rebuild = BuildStage.rewrite_build_script_for_fixed_hdf5(
+                context.build_script_in_image
+            )
+            (
+                stderr_patterns,
+                stack_keywords,
+                crash_type,
+                env,
+            ) = BuildStage.apply_vulnerable_hdf5_cve_match_policy(
+                expected_stderr_patterns=list(context.expected_stderr_patterns),
+                expected_stack_keywords=list(context.expected_stack_keywords),
+                expected_crash_type=context.expected_crash_type,
+                environment_variables=dict(context.environment_variables),
+            )
+        else:
+            stderr_patterns = list(context.expected_stderr_patterns)
+            stack_keywords = list(context.expected_stack_keywords)
+            crash_type = context.expected_crash_type
+            env = dict(context.environment_variables)
         return VerifyPlan(
             image_tag=context.docker_image_tag,
             pre_run_command=context.trigger_command,
             post_run_command=context.trigger_command,
-            environment_variables=dict(context.environment_variables),
+            environment_variables=env,
             expected_stdout_patterns=list(context.expected_stdout_patterns),
-            expected_stderr_patterns=list(context.expected_stderr_patterns),
-            expected_stack_keywords=list(context.expected_stack_keywords),
+            expected_stderr_patterns=stderr_patterns,
+            expected_stack_keywords=stack_keywords,
             expected_exit_code=context.expected_exit_code,
-            expected_crash_type=context.expected_crash_type,
+            expected_crash_type=crash_type,
+            patch_apply_command=patch_apply,
+            rebuild_command=rebuild,
+            post_rebuild_command=post_rebuild,
             pre_log_path=str(paths.pre_patch_log),
             post_log_path=str(paths.post_patch_log),
         )
@@ -234,7 +284,9 @@ class VerifyStage:
         builder.add_edge(START, "plan")
         builder.add_edge("plan", "execute")
         builder.add_edge("execute", END)
-        return builder.compile()
+        # False: do not inherit the parent workflow checkpointer. Internal state
+        # carries path helper objects that are not msgpack-serializable.
+        return builder.compile(checkpointer=False)
 
     def _verify_graph_plan_node(self, state: VerifyGraphState) -> VerifyGraphState:
         plan = self.plan_verify(state["prepared"].context, state["paths"])
@@ -356,6 +408,22 @@ class VerifyStage:
         expected_stack_keywords = list(poc.expected_stack_keywords) or list(knowledge.expected_stack_keywords)
         expected_crash_type = poc.expected_crash_type or self._infer_crash_type_fallback(poc)
         environment_variables = dict(poc.environment_variables)
+        expected_stderr_patterns = list(poc.expected_stderr_patterns)
+        dependency_fix_vulnerable_hdf5 = self._detect_vulnerable_hdf5_dependency_fix(
+            paths, build
+        )
+        if dependency_fix_vulnerable_hdf5:
+            (
+                expected_stderr_patterns,
+                expected_stack_keywords,
+                expected_crash_type,
+                environment_variables,
+            ) = BuildStage.apply_vulnerable_hdf5_cve_match_policy(
+                expected_stderr_patterns=expected_stderr_patterns,
+                expected_stack_keywords=expected_stack_keywords,
+                expected_crash_type=expected_crash_type,
+                environment_variables=environment_variables,
+            )
 
         return VerifyContext(
             cve_id=knowledge.cve_id,
@@ -367,7 +435,7 @@ class VerifyStage:
             target_binary=poc.target_binary or build.binary_or_entrypoint or build.expected_binary_path or "",
             trigger_command=poc.trigger_command or "",
             expected_stdout_patterns=list(poc.expected_stdout_patterns),
-            expected_stderr_patterns=list(poc.expected_stderr_patterns),
+            expected_stderr_patterns=expected_stderr_patterns,
             expected_stack_keywords=expected_stack_keywords,
             expected_exit_code=poc.expected_exit_code,
             expected_crash_type=expected_crash_type,
@@ -375,7 +443,28 @@ class VerifyStage:
             poc_run_verify_eligible=eligible,
             poc_run_verify_reason=reason,
             environment_variables=environment_variables,
+            trigger_mode=poc.trigger_mode or "",
+            dependency_fix_vulnerable_hdf5=dependency_fix_vulnerable_hdf5,
         )
+
+    def _detect_vulnerable_hdf5_dependency_fix(
+        self,
+        paths: VerifyStagePaths,
+        build: BuildArtifact,
+    ) -> bool:
+        """True when build stage gated vulnerable HDF5 into build.sh."""
+
+        marker = BuildStage.VULN_HDF5_MARKER
+        texts: list[str] = []
+        build_script = paths.build_dir / "build.sh"
+        if build_script.is_file():
+            try:
+                texts.append(build_script.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+        if build.build_script_content:
+            texts.append(build.build_script_content)
+        return any(marker in text for text in texts)
 
     def _infer_crash_type_fallback(self, poc: PoCArtifact) -> str:
         """Fallback for legacy poc_artifact.yaml that lacks expected_crash_type."""
@@ -385,19 +474,44 @@ class VerifyStage:
         """Determine the in-container project directory.
 
         优先级：
-          1. BuildArtifact.binary_or_entrypoint 反推（取上 2 层目录），如果它是绝对路径
-             例如 /opt/lua-5.4.4/src/lua → /opt/lua-5.4.4
-          2. 默认 ${PROJECT_DIR}（依赖镜像导出此环境变量）
-
-        返回的是要写到 verify_run.sh 里的"取值表达式"。
+          1. CMake out-of-tree plugin/binary: ``/src/<proj>/build/...`` → ``/src/<proj>``
+             (do not strip two path components; that yields ``.../build/src`` for
+             ``.../build/src/imageformats/kimg_*.so`` and verify then ``cd`` into
+             a directory that ``git clean`` deletes).
+          2. ``.../src/<binary>`` such as ``/opt/lua-5.4.4/src/lua`` → prefix
+          3. 默认 ${PROJECT_DIR}（依赖镜像导出此环境变量）
         """
-        binary = (build.binary_or_entrypoint or "").strip()
+
+        binary = (
+            (build.binary_or_entrypoint or build.expected_binary_path or "")
+            .strip()
+            .replace("\\", "/")
+        )
         if binary.startswith("/"):
-            parts = binary.rstrip("/").split("/")
-            if len(parts) >= 4:
-                inferred = "/".join(parts[:-2])
-                if inferred:
+            parts = [part for part in binary.rstrip("/").split("/") if part]
+            if "build" in parts:
+                idx = parts.index("build")
+                if idx >= 1:
+                    inferred = "/" + "/".join(parts[:idx])
+                    if inferred != "/":
+                        return inferred
+            if len(parts) >= 3 and parts[-2] == "src":
+                inferred = "/" + "/".join(parts[:-2])
+                if inferred != "/":
                     return inferred
+            if len(parts) >= 3:
+                inferred = "/" + "/".join(parts[:-2])
+                if inferred != "/":
+                    return inferred
+        dockerfile = build.dockerfile_content or ""
+        env_match = re.search(r"(?im)^ENV\s+PROJECT_DIR=(\S+)", dockerfile)
+        if env_match:
+            inferred = env_match.group(1).strip().strip("\"'")
+            if inferred and inferred != "${PROJECT_DIR}":
+                return inferred
+        workdir_match = re.search(r"(?im)^WORKDIR\s+(/src/\S+)", dockerfile)
+        if workdir_match:
+            return workdir_match.group(1).rstrip("/")
         return "${PROJECT_DIR}"
 
     def plan_verify(self, context: VerifyContext, paths: VerifyStagePaths) -> VerifyPlan:
@@ -514,29 +628,54 @@ class VerifyStage:
         plan: VerifyPlan,
         paths: VerifyStagePaths,
     ) -> None:
+        # WSL2 (vm.mmap_rnd_bits=32): an ASan PoC compiled as PIE can bare-crash
+        # (exit 139) during sanitizer startup; inject -no-pie into any -fsanitize
+        # compile/link command so the trigger is deterministic pre and post.
+        run_command = ensure_no_pie_for_asan(plan.pre_run_command)
         rendered = self._render_template(
             "verify_run.sh.j2",
             {
                 "target_binary": context.target_binary,
-                "run_command": plan.pre_run_command,
+                "run_command": run_command,
+                "run_command_shell": self._shell_quote(run_command or "true"),
+                "trigger_mode": context.trigger_mode,
+                "outer_asan_preload": should_outer_asan_preload(
+                    run_command, context.trigger_mode
+                ),
+                "trigger_timeout_sec": 120,
                 "repo_reset_command": plan.repo_reset_command,
-                # Prefer context.build_script_in_image (a typed field) over plan.rebuild_command
-                # (a string default) so future build-stage changes only need to update one place.
-                "rebuild_command": f"bash {context.build_script_in_image}",
+                "rebuild_command": plan.rebuild_command
+                or f"bash {context.build_script_in_image}",
+                "post_rebuild_command": plan.post_rebuild_command
+                or plan.rebuild_command
+                or f"bash {context.build_script_in_image}",
                 "patch_apply_command": plan.patch_apply_command,
                 "project_dir_var": context.project_dir_inside_image or "${PROJECT_DIR}",
             },
         )
         self.file_tool.write_text(str(paths.verify_run_script), rendered)
 
+    @staticmethod
+    def _shell_quote(value: str) -> str:
+        return "'" + value.replace("'", "'\"'\"'") + "'"
+
     def _copy_patch_diff(self, context: VerifyContext, paths: VerifyStagePaths) -> None:
         src = Path(context.patch_diff_path)
         if not src.exists():
             raise FileNotFoundError(f"patch.diff vanished: {src}")
-        self.file_tool.write_text(
-            str(paths.patch_diff_copy),
-            src.read_text(encoding="utf-8", errors="replace"),
-        )
+        raw = src.read_text(encoding="utf-8", errors="replace")
+        # Gate: drop ``Binary files ... differ`` stubs that lack GIT binary
+        # payloads so source hunks can still ``git apply`` (qpdf corpus extras).
+        filtered, dropped = strip_unapplyable_binary_stub_hunks(raw)
+        self.file_tool.write_text(str(paths.patch_diff_copy), filtered)
+        if dropped:
+            note_path = paths.verify_dir / "patch_filter_notes.txt"
+            note = (
+                "deeprepro:stripped-unapplyable-binary-stubs\n"
+                + "\n".join(f"- {path}" for path in dropped)
+                + "\n"
+            )
+            self.file_tool.write_text(str(note_path), note)
 
     def _run_one_pass(
         self,
@@ -730,9 +869,19 @@ class VerifyStage:
         )
 
     def _is_triggered(self, pass_result: dict, context: VerifyContext) -> bool:
-        """A pass is 'triggered' if any expected behavior is observed."""
+        """A pass is 'triggered' if expected vulnerability signals are observed.
 
-        # 兼容期同时支持 matched_error_patterns（旧字段）和 matched_stderr_patterns（新字段）
+        When knowledge/plan includes strong crash/sanitizer expectations (ASan,
+        SEGV, heap-buffer-overflow, …), only those strong matches count.
+        Soft diagnostic strings (e.g. ``Wrong duration in voice overlay``,
+        function names like ``calculate_beam``) often survive a correct patch
+        and must not alone mark post as still triggered.
+        """
+
+        if self._expected_requires_strong_trigger(context):
+            return self._has_strong_trigger_match(pass_result, context)
+
+        # Legacy / soft-only expectations: any matched pattern counts.
         if pass_result.get("matched_error_patterns") or pass_result.get("matched_stderr_patterns"):
             return True
         if pass_result.get("matched_stdout_patterns"):
@@ -745,6 +894,95 @@ class VerifyStage:
             return True
         if context.expected_exit_code is not None and pass_result.get("exit_code") == context.expected_exit_code:
             return True
+        return False
+
+    # Sanitizer / fatal-crash tokens. Substring match, case-insensitive.
+    STRONG_TRIGGER_TOKENS: tuple[str, ...] = (
+        "addresssanitizer",
+        "asan:",
+        "ubsan",
+        "undefinedbehaviorsanitizer",
+        "memorysanitizer",
+        "threadsanitizer",
+        "segv",
+        "segmentation fault",
+        "heap-buffer-overflow",
+        "stack-buffer-overflow",
+        "global-buffer-overflow",
+        "heap-use-after-free",
+        "stack-use-after-free",
+        "use-after-poison",
+        "use-after-free",
+        "double-free",
+        "negative-size-param",
+        "alloc-dealloc-mismatch",
+        "runtime error:",
+        "aborting",
+    )
+
+    def _is_strong_trigger_token(self, text: str) -> bool:
+        lowered = (text or "").strip().lower()
+        if not lowered:
+            return False
+        return any(token in lowered for token in self.STRONG_TRIGGER_TOKENS)
+
+    def _expected_requires_strong_trigger(self, context: VerifyContext) -> bool:
+        """True when plan expects at least one strong crash/sanitizer signal."""
+
+        candidates = list(context.expected_stderr_patterns or [])
+        candidates.extend(context.expected_stdout_patterns or [])
+        if context.expected_crash_type:
+            candidates.append(context.expected_crash_type)
+        return any(self._is_strong_trigger_token(item) for item in candidates)
+
+    def _iter_matched_signal_texts(self, pass_result: dict) -> list[str]:
+        texts: list[str] = []
+        for key in (
+            "matched_error_patterns",
+            "matched_stderr_patterns",
+            "matched_stdout_patterns",
+            "matched_stack_keywords",
+        ):
+            texts.extend(str(item) for item in (pass_result.get(key) or []) if item)
+        crash_type = pass_result.get("crash_type", "") or ""
+        if crash_type:
+            texts.append(str(crash_type))
+        return texts
+
+    def _expected_signal_texts(self, context: VerifyContext) -> list[str]:
+        texts = list(context.expected_stderr_patterns or [])
+        texts.extend(context.expected_stdout_patterns or [])
+        if context.expected_crash_type:
+            texts.append(context.expected_crash_type)
+        return texts
+
+    def _has_strong_trigger_match(self, pass_result: dict, context: VerifyContext) -> bool:
+        """Triggered under strong-signal policy."""
+
+        expected_texts = self._expected_signal_texts(context)
+        # When the plan names a concrete ASan bug (stack-buffer-overflow, …),
+        # a generic "AddressSanitizer" hit or unrelated kinds such as
+        # alloc-dealloc-mismatch must not count as the CVE trigger.
+        if specific_sanitizer_bugs_in(expected_texts):
+            haystacks = list(self._iter_matched_signal_texts(pass_result))
+            haystacks.append(str(pass_result.get("stderr") or ""))
+            haystacks.append(str(pass_result.get("stdout") or ""))
+            haystacks.append(str(pass_result.get("crash_type") or ""))
+            return haystack_has_specific_sanitizer_bug("\n".join(haystacks), expected_texts)
+
+        if any(self._is_strong_trigger_token(text) for text in self._iter_matched_signal_texts(pass_result)):
+            return True
+        crash_type = pass_result.get("crash_type", "") or ""
+        expected = (context.expected_crash_type or "").strip().lower()
+        if (
+            expected
+            and crash_type
+            and self._is_strong_trigger_token(expected)
+            and (expected in crash_type.lower() or crash_type.lower() in expected)
+        ):
+            return True
+        # Exit-code-only matches stay out of strong policy: patched runs often
+        # still exit non-zero on malformed PoC input without crashing.
         return False
 
     def _compute_confidence(self, pre: dict, post: dict) -> str:
@@ -915,7 +1153,16 @@ class VerifyStage:
                 trim_blocks=True,
                 lstrip_blocks=True,
             )
-            return env.get_template(template_name).render(**context).strip() + "\n"
+            render_ctx = dict(context)
+            if template_name == "verify_run.sh.j2":
+                run_cmd = render_ctx.get("run_command") or "true"
+                render_ctx.setdefault("run_command_shell", self._shell_quote(run_cmd))
+                render_ctx.setdefault(
+                    "outer_asan_preload",
+                    should_outer_asan_preload(run_cmd, str(render_ctx.get("trigger_mode") or "")),
+                )
+                render_ctx.setdefault("trigger_timeout_sec", 120)
+            return env.get_template(template_name).render(**render_ctx).strip() + "\n"
 
         if template_name == "verify.Dockerfile.j2":
             return f"FROM {context['base_image_tag']}\n\nWORKDIR /workspace\n"
@@ -936,7 +1183,11 @@ class VerifyStage:
                 f'    {context["patch_apply_command"]}',
                 '    echo "patch_apply_exit_code=$?"',
                 'fi',
-                f'{context["rebuild_command"]}',
+                'if [[ "${PATCH_MODE}" == "post" ]]; then',
+                f'    {context.get("post_rebuild_command", context["rebuild_command"])}',
+                'else',
+                f'    {context["rebuild_command"]}',
+                'fi',
                 'echo "build_rebuild_exit_code=$?"',
                 f'echo "target_binary={context["target_binary"]}"',
                 f'echo "trigger_command={context["run_command"]}"',

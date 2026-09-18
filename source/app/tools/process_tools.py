@@ -12,7 +12,22 @@ import os
 import subprocess
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def coerce_process_text(value: object) -> str:
+    """Normalize subprocess capture fields: None/bytes → str.
+
+    ``subprocess.run(..., text=True, capture_output=True)`` types stdout/stderr
+    as ``str | None``. Passing None into Pydantic ``str`` fields raises
+    ValidationError and aborts the whole build/poc stage.
+    """
+
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 class ProcessRequest(BaseModel):
@@ -31,6 +46,11 @@ class ProcessResult(BaseModel):
     exit_code: int = Field(default=1, description="退出码")
     stdout: str = Field(default="", description="标准输出")
     stderr: str = Field(default="", description="标准错误")
+
+    @field_validator("stdout", "stderr", mode="before")
+    @classmethod
+    def _coerce_captured_text(cls, value: object) -> str:
+        return coerce_process_text(value)
 
 
 class ProcessTool:
@@ -53,8 +73,8 @@ class ProcessTool:
                 check=False,
             )
         except subprocess.TimeoutExpired as error:
-            stdout = error.stdout or ""
-            stderr = error.stderr or ""
+            stdout = coerce_process_text(error.stdout)
+            stderr = coerce_process_text(error.stderr)
             return ProcessResult(
                 success=False,
                 exit_code=124,
@@ -67,6 +87,6 @@ class ProcessTool:
         return ProcessResult(
             success=completed.returncode == 0,
             exit_code=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            stdout=coerce_process_text(completed.stdout),
+            stderr=coerce_process_text(completed.stderr),
         )

@@ -357,7 +357,7 @@ def test_find_patch_diff_dual_prefix(tmp_path, monkeypatch):
         (src_path / "patch.diff").write_text("diff content 2\n", encoding="utf-8")
         found = find_patch_diff("CVE-FAKE")
         assert found is not None
-        assert "source/Dataset" in str(found)
+        assert "source/Dataset" in found.as_posix()
     finally:
         os.chdir(original_cwd)
 

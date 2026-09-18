@@ -583,6 +583,15 @@ class InferGitRefsTests(unittest.TestCase):
             variants,
         )
 
+    def test_invent_commit_without_dash_slash_derives_diff_variant(self) -> None:
+        variants = derive_reference_variants(
+            "https://invent.kde.org/frameworks/kimageformats/commit/297ed9a2fe339bfe36916b9fce628c3242e5be0f"
+        )
+        self.assertIn(
+            "https://invent.kde.org/frameworks/kimageformats/commit/297ed9a2fe339bfe36916b9fce628c3242e5be0f.diff",
+            variants,
+        )
+
     def test_osv_without_commit_reference_is_out_of_scope(self) -> None:
         osv_payload = {
             "references": [
@@ -612,6 +621,159 @@ class InferGitRefsTests(unittest.TestCase):
 
         self.assertEqual(infer_repo_url(osv_payload), "https://github.com/lua/lua.git")
         self.assertEqual(merged.language, "C")
+
+    def test_infer_repo_url_skips_oss_fuzz_vulns_metadata_mirror(self) -> None:
+        osv_payload = {
+            "affected": [
+                {
+                    "package": {"name": "matio", "ecosystem": "OSS-Fuzz"},
+                    "ranges": [
+                        {
+                            "type": "GIT",
+                            "repo": "https://github.com/tbeu/matio",
+                            "events": [{"introduced": "0"}, {"fixed": "abc123"}],
+                        }
+                    ],
+                }
+            ],
+            "references": [
+                {
+                    "type": "FIX",
+                    "url": "https://github.com/google/oss-fuzz-vulns/commit/37b781ace1b4228fc36483bb7e30c72ea9d4c3d6",
+                },
+                {
+                    "type": "FIX",
+                    "url": "https://github.com/tbeu/matio/commit/abcdef0123456789abcdef0123456789abcdef01",
+                },
+            ],
+        }
+        self.assertEqual(infer_repo_url(osv_payload), "https://github.com/tbeu/matio.git")
+
+    def test_infer_repo_url_prefers_package_matching_commit_over_metadata(self) -> None:
+        osv_payload = {
+            "affected": [{"package": {"name": "matio"}}],
+            "references": [
+                {
+                    "type": "FIX",
+                    "url": "https://github.com/google/oss-fuzz-vulns/commit/37b781ace1b4228fc36483bb7e30c72ea9d4c3d6",
+                },
+                {
+                    "type": "FIX",
+                    "url": "https://github.com/tbeu/matio/commit/abcdef0123456789abcdef0123456789abcdef01",
+                },
+            ],
+        }
+        self.assertEqual(infer_repo_url(osv_payload), "https://github.com/tbeu/matio.git")
+
+    def test_merge_osv_recovers_from_stale_oss_fuzz_vulns_task(self) -> None:
+        task = TaskModel(
+            task_id="CVE-2021-36977",
+            cve_id="CVE-2021-36977",
+            repo_url="https://github.com/google/oss-fuzz-vulns.git",
+            vulnerable_ref="f9b476d92c9ab5bee29dc24da8ab179596475afb",
+            fixed_ref="37b781ace1b4228fc36483bb7e30c72ea9d4c3d6",
+            language="Python",
+            references=[],
+            reference_details=[],
+        )
+        osv_payload = {
+            "affected": [
+                {
+                    "package": {"name": "matio", "ecosystem": "OSS-Fuzz"},
+                    "ranges": [
+                        {
+                            "type": "GIT",
+                            "repo": "https://github.com/tbeu/matio",
+                            "events": [{"introduced": "0"}, {"fixed": "deadbeefcafebabe"}],
+                        }
+                    ],
+                }
+            ],
+            "references": [
+                {
+                    "type": "FIX",
+                    "url": "https://github.com/google/oss-fuzz-vulns/commit/37b781ace1b4228fc36483bb7e30c72ea9d4c3d6",
+                },
+            ],
+        }
+        stage = KnowledgeStage()
+        with patch("app.stages.knowledge.fetch_repo_primary_language", return_value="C"), patch(
+            "app.stages.knowledge.fetch_github_parent_ref",
+            return_value="parentsha",
+        ):
+            merged = stage._merge_osv_into_task(task, osv_payload)
+
+        self.assertEqual(merged.repo_url, "https://github.com/tbeu/matio.git")
+        self.assertEqual(merged.fixed_ref, "deadbeefcafebabe")
+        self.assertEqual(merged.vulnerable_ref, "parentsha")
+        self.assertEqual(merged.language, "C")
+
+    def test_merge_osv_drops_stale_refs_when_repo_already_correct(self) -> None:
+        task = TaskModel(
+            task_id="CVE-2021-36977",
+            cve_id="CVE-2021-36977",
+            repo_url="https://github.com/tbeu/matio.git",
+            vulnerable_ref="f9b476d92c9ab5bee29dc24da8ab179596475afb",
+            fixed_ref="37b781ace1b4228fc36483bb7e30c72ea9d4c3d6",
+            language="C",
+            references=[],
+            reference_details=[],
+        )
+        osv_payload = {
+            "affected": [
+                {
+                    "package": {"name": "matio", "ecosystem": "OSS-Fuzz"},
+                    "ranges": [
+                        {
+                            "type": "GIT",
+                            "repo": "https://github.com/google/oss-fuzz-vulns",
+                            "events": [
+                                {"introduced": "0"},
+                                {"fixed": "37b781ace1b4228fc36483bb7e30c72ea9d4c3d6"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "references": [
+                {
+                    "type": "ADVISORY",
+                    "url": "https://github.com/google/oss-fuzz-vulns/blob/main/vulns/matio/OSV-2021-440.yaml",
+                },
+                {
+                    "type": "FIX",
+                    "url": "https://github.com/google/oss-fuzz-vulns/commit/37b781ace1b4228fc36483bb7e30c72ea9d4c3d6",
+                },
+            ],
+        }
+        related_payload = {
+            "affected": [
+                {
+                    "package": {"name": "matio", "ecosystem": "OSS-Fuzz"},
+                    "ranges": [
+                        {
+                            "type": "GIT",
+                            "repo": "git://git.code.sf.net/p/matio/matio",
+                            "events": [
+                                {"introduced": "1ce8f2d1845ecdde19a35605cabdbb884776d52d"},
+                                {"fixed": "cddcdad17864c4b95ead23581047b41636f180a3"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "references": [],
+        }
+        stage = KnowledgeStage()
+        with patch.object(stage, "_fetch_osv", return_value=related_payload), patch(
+            "app.stages.knowledge.fetch_github_parent_ref",
+            return_value="2945c0ded5edabcd",
+        ):
+            merged = stage._merge_osv_into_task(task, osv_payload)
+
+        self.assertEqual(merged.repo_url, "https://github.com/tbeu/matio.git")
+        self.assertEqual(merged.fixed_ref, "cddcdad17864c4b95ead23581047b41636f180a3")
+        self.assertEqual(merged.vulnerable_ref, "2945c0ded5edabcd")
 
 
 if __name__ == "__main__":
