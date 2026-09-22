@@ -607,6 +607,13 @@ class PocStage:
         reproduction_recipe_summaries = self._summarize_reproduction_recipes(knowledge.reproduction_recipes)
         recipe_base64_blobs = self._extract_recipe_base64_blobs(knowledge.reproduction_recipes)
         dataset_poc_filenames, dataset_poc_base64_blobs = self._collect_dataset_poc_payloads(knowledge.cve_id)
+        if not dataset_poc_base64_blobs:
+            # Empty authoritative seed pool: mine real input samples from the
+            # repo's test tree (LLM cannot synthesize checksummed binary
+            # formats, but repos usually ship valid samples).
+            dataset_poc_filenames, dataset_poc_base64_blobs = self._mine_repo_seed_payloads(
+                knowledge, build
+            )
         cli_flags = self._extract_candidate_cli_flags(knowledge.reproduction_hints + reproduction_recipe_summaries)
         reference_poc_summaries = self._collect_reference_poc_summaries(knowledge.cve_id)
         repo_evidence_blocks = self._collect_repo_evidence(paths.repo_dir, trigger_files)
@@ -1839,6 +1846,50 @@ class PocStage:
                         f"FILE: {path.name}\nENCODING: text\nCONTENT:\n{self._truncate_text(content, self.REFERENCE_POC_CHAR_LIMIT)}"
                     )
         return summaries[: self.REFERENCE_POC_BLOCK_LIMIT]
+
+    def _mine_repo_seed_payloads(
+        self,
+        knowledge: KnowledgeModel,
+        build: BuildArtifact,
+    ) -> tuple[list[str], list[str]]:
+        """Mine real input samples from the repo test tree (seed fallback).
+
+        Triggered when the Dataset authoritative pool is empty. Extensions
+        are inferred from the knowledge text (summary / repo / affected
+        files); smallest samples are preferred and copied into the context
+        as authoritative payloads.
+        """
+
+        from app.stages.seed_mining import infer_seed_extensions, mine_repo_seeds
+
+        repo_path = Path(build.repo_local_path) if build.repo_local_path else None
+        extensions = infer_seed_extensions(
+            knowledge.summary,
+            knowledge.vulnerability_type,
+            knowledge.repo_url,
+            " ".join(knowledge.affected_files),
+            " ".join(knowledge.reproduction_hints),
+        )
+        if not repo_path or not extensions:
+            return [], []
+        seeds = mine_repo_seeds(repo_path, extensions)
+        if not seeds:
+            return [], []
+
+        filenames: list[str] = []
+        blobs: list[str] = []
+        for path in seeds:
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                continue
+            if not raw or len(raw) > self.DATASET_POC_BYTE_LIMIT:
+                continue
+            filenames.append(path.name)
+            blobs.append(base64.b64encode(raw).decode("ascii"))
+            if len(blobs) >= self.DATASET_POC_COUNT_LIMIT:
+                break
+        return self._order_dataset_poc_payloads(filenames, blobs)
 
     def _collect_dataset_poc_payloads(self, cve_id: str) -> tuple[list[str], list[str]]:
         """Return (filenames, base64 blobs) for authoritative dataset PoC payloads."""
