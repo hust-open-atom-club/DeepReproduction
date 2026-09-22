@@ -65,6 +65,9 @@ def route_after_verify(state):
         return "failed"
     if verify.verdict == "success":
         return "success"
+    if state.get("verify_recovery_action"):
+        # verify_recovery 闭环：ref 相关失败且已有确定性恢复决策，回 build 重建。
+        return "build"
     if verify.verdict == "inconclusive":
         return "inconclusive"
     return "failed"

@@ -1252,6 +1252,49 @@ def verify_node(state):
     else:
         final_status = "failed"
 
+    # Deterministic ref-recovery loop ("verify 无闭环" debt): when the failure
+    # is ref-related and a fresh candidate exists, swap refs and send the
+    # workflow back to build instead of stopping at review.
+    recovery = None
+    if final_status != "success":
+        from app.stages.verify_recovery import MAX_RECOVERY_ROUNDS, plan_recovery
+
+        rounds = state.get("verify_recovery_count", 0)
+        if rounds < MAX_RECOVERY_ROUNDS:
+            repo_path = Path(build.repo_local_path) if build and build.repo_local_path else None
+            recovery = plan_recovery(
+                verify,
+                knowledge,
+                repo_path=repo_path,
+                tried_refs=state.get("fixed_ref_tried", []),
+            )
+
+    if recovery is not None:
+        from app.stages.verify_recovery import apply_decision
+
+        return {
+            "verify": verify,
+            "knowledge": apply_decision(knowledge, recovery),
+            "build": None,
+            "poc": None,
+            "current_stage": "verify",
+            "verify_recovery_action": {
+                "kind": recovery.kind,
+                "new_fixed_ref": recovery.new_fixed_ref,
+                "new_vulnerable_ref": recovery.new_vulnerable_ref,
+                "note": recovery.note,
+            },
+            "verify_recovery_count": state.get("verify_recovery_count", 0) + 1,
+            "fixed_ref_tried": recovery.tried_refs,
+            "human_action_required": False,
+            "review_reason": "",
+            "final_status": "running",
+            "stage_history": history,
+            "stage_status": stage_status,
+            "artifacts": artifacts,
+            "last_error": None,
+        }
+
     return {
         "verify": verify,
         "current_stage": "verify",
