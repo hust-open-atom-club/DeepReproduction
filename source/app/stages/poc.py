@@ -115,6 +115,8 @@ class PocContext(BaseModel):
     expected_error_patterns: list[str] = Field(default_factory=list, description="Expected error patterns.")
     expected_stack_keywords: list[str] = Field(default_factory=list, description="Expected stack keywords.")
     candidate_entrypoints: list[str] = Field(default_factory=list, description="Candidate entrypoints.")
+    built_library_paths: list[str] = Field(default_factory=list, description="Library artifacts (.a/.so) found in the compiled image.")
+    sibling_harness_excerpt: str = Field(default="", description="Verified harness source from a sibling CVE on the same repo (bug-agnostic scaffolding).")
     candidate_trigger_files: list[str] = Field(default_factory=list, description="Files likely related to triggering.")
     candidate_cli_flags: list[str] = Field(default_factory=list, description="Command-line flags discovered from hints.")
     reference_poc_summaries: list[str] = Field(default_factory=list, description="Reference PoC summaries.")
@@ -240,6 +242,8 @@ class PocGraphState(TypedDict, total=False):
     current_plan: PocPlan
     outcome: PocExecutionOutcome
     attempt: int
+    tried_targets: list[str]
+    sweep_pending: bool
 
 
 class PocStrategyDecision(BaseModel):
@@ -535,6 +539,7 @@ class PocStage:
     """PoC 阶段协调器。"""
 
     MAX_REPLAN_ATTEMPTS = 3
+    MAX_CANDIDATE_SWEEPS = 3
     MAX_LLM_NO_RESPONSE_RETRIES = 2
     PATCH_EXCERPT_CHAR_LIMIT = 2200
     REPO_EVIDENCE_BLOCK_LIMIT = 4
@@ -603,6 +608,13 @@ class PocStage:
         patch_metadata = self._extract_patch_metadata(patch_diff_text)
         candidate_entrypoints = [item for item in [build.binary_or_entrypoint, build.expected_binary_path] if item]
         candidate_entrypoints.extend(self._discover_candidate_binaries(paths.repo_dir))
+        # 镜像内扫描：autotools 构建产物只存在于镜像里（如 lrzip 的
+        # .libs/liblrzip_demo），宿主 repo 目录扫不到；CLI 触发不了的
+        # 库级漏洞需要这些 harness 样二进制作为候选。
+        candidate_entrypoints.extend(self._scan_image_candidate_binaries(build))
+        candidate_entrypoints = list(dict.fromkeys(candidate_entrypoints))
+        built_library_paths = self._scan_image_library_artifacts(build, knowledge.repo_url or "")
+        sibling_harness_excerpt = self._collect_sibling_harness(paths, build, knowledge.repo_url or "")
         trigger_files = patch_affected_files or list(knowledge.affected_files)
         reproduction_recipe_summaries = self._summarize_reproduction_recipes(knowledge.reproduction_recipes)
         recipe_base64_blobs = self._extract_recipe_base64_blobs(knowledge.reproduction_recipes)
@@ -638,6 +650,8 @@ class PocStage:
             expected_error_patterns=list(knowledge.expected_error_patterns),
             expected_stack_keywords=list(knowledge.expected_stack_keywords),
             candidate_entrypoints=sorted(set(candidate_entrypoints)),
+            built_library_paths=built_library_paths,
+            sibling_harness_excerpt=sibling_harness_excerpt,
             candidate_trigger_files=trigger_files[:12],
             candidate_cli_flags=cli_flags,
             reference_poc_summaries=reference_poc_summaries,
@@ -1006,6 +1020,7 @@ class PocStage:
             "Reference PoC excerpts:",
             "\n\n---\n\n".join(self._reference_poc_prompt_blocks(context.reference_poc_summaries, detailed=False)) or "<empty>",
             f"Candidate entrypoints: {json.dumps(context.candidate_entrypoints, ensure_ascii=False)}",
+            f"Built library artifacts in image: {json.dumps(context.built_library_paths, ensure_ascii=False)}",
             f"Candidate CLI flags: {json.dumps(context.candidate_cli_flags, ensure_ascii=False)}",
             f"Inferred input modes: {json.dumps(context.inferred_input_modes, ensure_ascii=False)}",
             f"Patch changed functions: {json.dumps(context.patch_changed_functions, ensure_ascii=False)}",
@@ -1043,6 +1058,11 @@ class PocStage:
             "When recipe/dataset base64 is present, set payload_content to that base64 string (or the decoded bytes semantics) and keep the original filename when possible.",
             "Prefer CLI flags from reproduction recipes/hints over inventing short options; if a flag is rejected as unknown, switch to flags shown in evidence.",
             "If the build target is a shared library or Qt plugin (.so/.dylib/.dll, especially under imageformats/), never execute it directly. Use trigger_mode=library-harness with a tiny loader (for Qt: QImageReader + QT_PLUGIN_PATH).",
+            "LIBRARY HARNESS STRATEGY: when the patch touches library-internal code and NO candidate binary consumes a testcase file (e.g. the only CLI is a network client or an interactive tool that ignores file input), generate your own harness instead of forcing the CLI:",
+            "  1. Put the harness C source into auxiliary_files (e.g. 'harness.c'): read argv[1] into a heap buffer, build the minimal state, and call the vulnerable library API directly (stub network/file callbacks with fixed buffers as needed). Keep it under ~120 lines.",
+            "  2. In run_script_override: compile it first, e.g. clang -g -O0 -fsanitize=address -shared-libasan -no-pie -I<project include dirs> /workspace/artifacts/poc/inputs/harness.c -o /tmp/harness <exact library paths from the Built library artifacts list>, then export ASAN_OPTIONS=abort_on_error=1:symbolize=0:detect_leaks=0 (symbolize=0 avoids DEADLYSIGNAL symbolizer storms) and run /tmp/harness <payload path>. Copy the library path EXACTLY from the listing (it is usually under <project>/src/.libs/ for autotools builds).",
+            "  3. Set target_binary to the compiled harness path and trigger_mode=library-harness; keep target_args/run_command consistent with step 2.",
+            f"Reference harness scaffolding from a verified sibling CVE on this repo (reuse the callback-stub/file-reading structure, REWRITE the trigger call for this CVE): {context.sibling_harness_excerpt or '<none>'}",
             "Adapt any existing PoC or hint to the current workspace layout inside Docker.",
             f"The build image keeps the checked-out project under {self._container_project_dir(context.repo_url)}.",
             "The repository is mounted at /workspace/repo.",
@@ -1173,6 +1193,24 @@ class PocStage:
                     "- Do not only change rationale, confidence, or source_of_truth.",
                 ]
             )
+            if failure_kind == "non_triggering":
+                harness_like = [
+                    item
+                    for item in (context.candidate_entrypoints or [])
+                    if any(tag in item.lower() for tag in ("_fuzzer", "fuzzer", "_demo", "_harness", "_target"))
+                    and item != context.target_binary
+                ]
+                if harness_like:
+                    sections.extend(
+                        [
+                            "Untriggered target guidance:",
+                            f"The previous target '{context.target_binary or '<build default>'}' ran without triggering the bug.",
+                            "Library-level bugs are often NOT reachable through the main CLI binary; the crash only happens through the library API.",
+                            f"Switch target_binary to one of these image-discovered harness-like binaries: {json.dumps(harness_like[:6], ensure_ascii=False)}.",
+                            "For libtool wrapper scripts use the real ELF under .libs/ (the wrapper breaks the ASan preload check).",
+                            "Feed the testcase file path as the harness binary's input argument.",
+                        ]
+                    )
             if failure_kind == "payload_invalid":
                 sections.extend(
                     [
@@ -1434,6 +1472,7 @@ class PocStage:
             self._route_after_poc_execute,
             {
                 "plan": "plan",
+                "execute": "execute",
                 "done": END,
             },
         )
@@ -1470,9 +1509,67 @@ class PocStage:
         updates: PocGraphState = {
             "outcome": outcome,
             "attempt": state.get("attempt", 0) + 1,
+            "sweep_pending": False,
             "current_plan": plan,
         }
         if not (outcome.artifact.execution_success and outcome.artifact.reproducer_verified):
+            # Tier-1 确定性候选轮换：目标跑完但未触发（non_triggering）且候选里有
+            # 未试过的 harness 样二进制 → 直接换靶重执行，不烧 LLM。
+            tried_targets = list(state.get("tried_targets", []))
+            if (
+                outcome.artifact.execution_success
+                and len(tried_targets) < self.MAX_CANDIDATE_SWEEPS
+            ):
+                sweep_candidates = [
+                    item
+                    for item in (state["current_context"].candidate_entrypoints or [])
+                    if any(tag in item.lower() for tag in ("_fuzzer", "fuzzer", "_demo", "_harness", "_target"))
+                    and item != plan.target_binary
+                    and item not in tried_targets
+                ]
+                # 排序：lib* 库 API demo + .libs/ 真 ELF 优先——功能 demo 常把输出
+                # 写到输入旁，断言噪音会抢先占用轮换预算（lrzip 实证）。
+                def _sweep_rank(path: str) -> tuple[int, int, int]:
+                    lowered = path.lower()
+                    return (
+                        0 if "/.libs/" in lowered else 1,
+                        0 if lowered.rsplit("/", 1)[-1].startswith("lib") else 1,
+                        len(path),
+                    )
+
+                sweep_candidates.sort(key=_sweep_rank)
+                if sweep_candidates:
+                    next_candidate = sweep_candidates[0]
+                    # 干净命令 + 喂载荷副本：继承旧 CLI 参数或与载荷同目录都会让
+                    # demo 类二进制在漏洞路径之前 fatal/断言，伪装成崩溃或漏触发；
+                    # verify pre/post 同目录两连跑会撞 File exists。
+                    swept_command = (
+                        "rm -rf /tmp/poc_sweep && mkdir -p /tmp/poc_sweep && "
+                        f"cp '/workspace/artifacts/poc/payloads/{plan.payload_filename}' /tmp/poc_sweep/in.bin && "
+                        f"cd /tmp/poc_sweep && '{next_candidate}' /tmp/poc_sweep/in.bin"
+                    )
+                    swept_plan = plan.model_copy(
+                        update={
+                            "target_binary": next_candidate,
+                            "trigger_mode": "library-harness",
+                            "run_command": swept_command,
+                            "rationale": (
+                                (plan.rationale or "")
+                                + f" [candidate-sweep: {next_candidate}]"
+                            ).strip(),
+                            "source_of_truth": "candidate_sweep",
+                        }
+                    )
+                    new_tried = list(tried_targets)
+                    if plan.target_binary and plan.target_binary not in new_tried:
+                        new_tried.append(plan.target_binary)
+                    return {
+                        "outcome": outcome,
+                        "attempt": state.get("attempt", 0) + 1,
+                        "tried_targets": new_tried,
+                        "sweep_pending": True,
+                        "current_plan": swept_plan,
+                    }
             current_context = self._build_retry_context(
                 state["current_context"],
                 paths,
@@ -1514,6 +1611,9 @@ class PocStage:
             return "done"
         if outcome.artifact.execution_success and outcome.artifact.reproducer_verified:
             return "done"
+        if state.get("sweep_pending"):
+            # 候选轮换：同一 plan 换靶直接重执行。
+            return "execute"
         # When multiple authoritative dataset payloads exist, keep cycling through
         # them until one triggers (or the cursor wraps past the last seed).
         context = state.get("current_context")
@@ -1690,6 +1790,135 @@ class PocStage:
         if path is None:
             return ""
         return path.read_text(encoding="utf-8", errors="replace")
+
+    _SIBLING_HARNESS_EXCERPT_LIMIT = 6000
+
+    _IMAGE_HARNESS_SCAN_CMD = (
+        "find /src -type f -executable "
+        "\\( -name '*_demo' -o -name '*_fuzzer' -o -name '*_harness' "
+        "-o -name '*_target' -o -name 'fuzzer*' \\) "
+        "! -path '*/.git/*' 2>/dev/null | sort | head -20"
+    )
+
+    def _scan_image_library_artifacts(self, build, repo_url: str) -> list[str]:
+        """列出编译镜像内项目目录下的库产物（.a/.so），供库级 harness 链接。"""
+
+        image_tag = (getattr(build, "compiled_image_tag", "") or "").strip()
+        if not image_tag:
+            return []
+        project_dir = self._container_project_dir(repo_url)
+        cmd = (
+            f"find {project_dir} -maxdepth 4 \( -name '*.a' -o -name '*.so' -o -name '*.so.*' \) "
+            "! -path '*/.git/*' 2>/dev/null | sort | head -30"
+        )
+        try:
+            result = self.docker_tool.run_container(
+                DockerRunRequest(image_tag=image_tag, command=["bash", "-lc", cmd])
+            )
+        except Exception:
+            return []
+        if not result.success:
+            return []
+        return [
+            line.strip()
+            for line in (result.stdout or "").splitlines()
+            if line.strip().startswith("/")
+        ][:30]
+
+
+    def _collect_sibling_harness(self, paths, build, repo_url: str = "") -> str:
+        """收集同仓库兄弟 CVE 已验证的 harness 源码作为脚手架参考。
+
+        harness 的「网络回调桩 + 从文件读入 + 调用库 API」骨架与具体漏洞无关，
+        同 repo 复用合法（类似仓库测试夹具）；触发语句由 LLM 按当前 CVE 重写。
+        """
+
+        try:
+            siblings_root = Path(paths.workspace_root).resolve().parent
+        except Exception:
+            return ""
+        my_repo_dir = ""
+        try:
+            my_repo_dir = Path(build.repo_local_path or "").resolve().name
+        except Exception:
+            pass
+        if not my_repo_dir:
+            return ""
+        best = ""
+        my_repo = (repo_url or "").lower().removesuffix(".git")
+        patterns = (
+            "CVE-*/artifacts/poc/inputs/harness.c",
+            "CVE-*/artifacts/poc/inputs/*.c",
+            "CVE-*/artifacts/poc/payloads/*.c",
+            "CVE-*/artifacts/poc/payloads/*.cc",
+        )
+        seen_files: set[Path] = set()
+        for pattern in patterns:
+            for candidate in sorted(siblings_root.glob(pattern)):
+                if candidate in seen_files or not candidate.is_file():
+                    continue
+                seen_files.add(candidate)
+                ws = candidate.parents[3]
+                if ws.name == Path(paths.workspace_root).resolve().name:
+                    continue
+                # 同仓库过滤：兄弟 CVE 的 Dataset task.yaml repo_url 必须一致，
+                # 否则会把别的项目的 C 文件当参考（unicorn/36979 实证）。
+                task_yaml = siblings_root.parent / "Dataset" / ws.name / "vuln_yaml" / "task.yaml"
+                try:
+                    sibling_repo = ""
+                    for line in task_yaml.read_text(encoding="utf-8", errors="replace").splitlines():
+                        if line.startswith("repo_url:"):
+                            sibling_repo = line.split(":", 1)[1].strip().lower().removesuffix(".git")
+                            break
+                except OSError:
+                    continue
+                if not my_repo or not sibling_repo or sibling_repo != my_repo:
+                    continue
+                artifact = ws / "artifacts" / "poc" / "poc_artifact.yaml"
+                try:
+                    if "reproducer_verified: true" not in artifact.read_text(encoding="utf-8", errors="replace"):
+                        continue
+                except OSError:
+                    continue
+                try:
+                    source = candidate.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if len(source) > self._SIBLING_HARNESS_EXCERPT_LIMIT:
+                    source = source[: self._SIBLING_HARNESS_EXCERPT_LIMIT] + "\n/* ...truncated... */"
+                best = f"{ws.name} ({candidate.name}):\n{source}"
+                return best
+        return best
+
+
+    def _scan_image_candidate_binaries(self, build) -> list[str]:
+        """扫描编译镜像里的 harness 样可执行文件（demo/fuzzer/harness/target）。
+
+        库级漏洞（如 CVE-2022-28044）的崩溃点只经库 API 到达，CLI 触发不了；
+        autotools 构建的演示二进制（liblrzip_demo 等）只存在于镜像内。
+        """
+
+        image_tag = (getattr(build, "compiled_image_tag", "") or "").strip()
+        if not image_tag:
+            return []
+        try:
+            result = self.docker_tool.run_container(
+                DockerRunRequest(
+                    image_tag=image_tag,
+                    command=["bash", "-lc", self._IMAGE_HARNESS_SCAN_CMD],
+                )
+            )
+        except Exception:
+            return []
+        if not result.success:
+            return []
+        candidates = [
+            line.strip()
+            for line in (result.stdout or "").splitlines()
+            if line.strip().startswith("/")
+        ]
+        return candidates[:10]
+
 
     def _discover_candidate_binaries(self, repo_dir: Path) -> list[str]:
         candidates: list[str] = []
@@ -2607,6 +2836,13 @@ int main(int argc, char **argv)
             plan.target_binary = plugin_path
 
         if not self._looks_like_shared_library(plan.target_binary):
+            return plan
+
+        # Qt 专属改写只适用于 Qt 图像插件（kimg_*.so / imageformats/）。普通
+        # 共享库（如 wolfmqtt 的 libwolfmqtt.so）被套上 Qt loader 只会编译失败；
+        # 库级触发交给 LLM 的 LIBRARY HARNESS STRATEGY。
+        lowered = (plan.target_binary or "").lower()
+        if "kimg_" not in lowered and "/imageformats/" not in lowered:
             return plan
 
         plan.target_binary = self._correct_qt_plugin_binary_path(plan.target_binary)
