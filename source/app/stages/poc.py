@@ -563,7 +563,21 @@ class PocStage:
         """生成 PoC 阶段静态元数据。"""
 
         if not build.build_success:
-            raise RuntimeError("build artifact must be successful before running poc stage")
+            # 构建方差（如 apt 网络抖动）会把 build_artifact 覆盖为失败，但最后一次
+            # 成功的构建快照与编译镜像仍在——回读快照/从镜像提取验证过的
+            # build.sh，poc 不因 build 重跑失败而中断复现链路。
+            from app.stages.last_good_build import load_last_good_build, restore_from_compiled_image
+
+            build_dir = Path(workspace) / "artifacts" / "build"
+            snapshot = load_last_good_build(build_dir)
+            if snapshot is not None:
+                build = snapshot
+            else:
+                restored = restore_from_compiled_image(build_dir, build)
+                if restored is not None:
+                    build = restored
+            if not build.build_success:
+                raise RuntimeError("build artifact must be successful before running poc stage")
 
         paths = PocStagePaths(workspace)
         return {

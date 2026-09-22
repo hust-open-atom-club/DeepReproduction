@@ -71,6 +71,18 @@ def load_inputs(cve_id: str, dataset_root: str, workspace_root: str):
 
     knowledge = KnowledgeModel(**(yaml.safe_load(knowledge_path.read_text(encoding="utf-8")) or {}))
     build = BuildArtifact(**(yaml.safe_load(build_artifact_path.read_text(encoding="utf-8")) or {}))
+    if not build.build_success:
+        # 后续失败的 build 重跑会覆盖 build_artifact.yaml；回读最后成功构建快照，
+        # verify 才能拿到与已验证 poc 一致的镜像/脚本元数据。
+        from app.stages.last_good_build import load_last_good_build, restore_from_compiled_image
+
+        snapshot = load_last_good_build(workspace / "artifacts" / "build")
+        if snapshot is not None:
+            build = snapshot
+        else:
+            restored = restore_from_compiled_image(workspace / "artifacts" / "build", build)
+            if restored is not None:
+                build = restored
     poc = PoCArtifact(**(yaml.safe_load(poc_artifact_path.read_text(encoding="utf-8")) or {}))
     return knowledge, build, poc, str(workspace)
 
