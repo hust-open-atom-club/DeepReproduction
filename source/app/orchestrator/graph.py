@@ -66,6 +66,7 @@ def build_app_graph(checkpointer=None):
         route_after_verify,
         {
             "success": "finalize",
+            "build": "build",
             "failed": "review",
             "inconclusive": "review",
         },
