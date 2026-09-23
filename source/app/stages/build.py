@@ -719,6 +719,48 @@ class BuildStage:
         )
         return BuildExecutionOutcome(plan=build_plan, artifact=artifact)
 
+    def _docker_apt_proxy_fallback(self) -> str:
+        """宿主代理兜底：容器无法直连镜像源时，apt 兜底链经
+        host.docker.internal 走宿主代理/转发代理重试。
+
+        DEEPREPRO_DOCKER_APT_PROXY 可覆盖地址；设为 off/none/0 关闭兜底。
+        """
+        import os
+
+        raw = os.getenv("DEEPREPRO_DOCKER_APT_PROXY", "http://host.docker.internal:3128").strip()
+        if not raw or raw.lower() in {"off", "none", "0"}:
+            return ""
+        if not raw.startswith("http"):
+            raw = f"http://{raw}"
+        return raw
+    def _docker_apt_proxy_fallback(self) -> str:
+        """宿主代理兜底：容器无法直连镜像源时，apt 兜底链经
+        host.docker.internal 走宿主代理/转发代理重试。
+
+        DEEPREPRO_DOCKER_APT_PROXY 可覆盖地址；设为 off/none/0 关闭兜底。
+        """
+        import os
+
+        raw = os.getenv("DEEPREPRO_DOCKER_APT_PROXY", "http://host.docker.internal:3128").strip()
+        if not raw or raw.lower() in {"off", "none", "0"}:
+            return ""
+        if not raw.startswith("http"):
+            raw = f"http://{raw}"
+        return raw
+    def _docker_apt_proxy_fallback(self) -> str:
+        """宿主代理兜底：容器无法直连镜像源时，apt 兜底链经
+        host.docker.internal 走宿主代理/转发代理重试。
+
+        DEEPREPRO_DOCKER_APT_PROXY 可覆盖地址；设为 off/none/0 关闭兜底。
+        """
+        import os
+
+        raw = os.getenv("DEEPREPRO_DOCKER_APT_PROXY", "http://host.docker.internal:3128").strip()
+        if not raw or raw.lower() in {"off", "none", "0"}:
+            return ""
+        if not raw.startswith("http"):
+            raw = f"http://{raw}"
+        return raw
     def persist_build_outputs(
         self,
         artifact: BuildArtifact,
@@ -729,6 +771,45 @@ class BuildStage:
         """Persist the final build artifact and self-verification payload."""
 
         self._write_yaml_file(paths.build_artifact_yaml, artifact.model_dump(mode="json"))
+
+        if artifact.build_success:
+            # 固化最后成功构建快照：后续失败的 build 重跑会把
+            # build_artifact.yaml/build.sh 覆盖成未验证的内容，poc/verify
+            # 检测到 build_success=false 时回读本快照。
+            self._write_yaml_file(
+                paths.build_dir / "last_good_build.yaml",
+                {
+                    "cve_id": cve_id,
+                    "saved_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+                    "artifact": artifact.model_dump(mode="json"),
+                },
+            )
+
+        if artifact.build_success:
+            # 固化最后成功构建快照：后续失败的 build 重跑会把
+            # build_artifact.yaml/build.sh 覆盖成未验证的内容，poc/verify
+            # 检测到 build_success=false 时回读本快照。
+            self._write_yaml_file(
+                paths.build_dir / "last_good_build.yaml",
+                {
+                    "cve_id": cve_id,
+                    "saved_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+                    "artifact": artifact.model_dump(mode="json"),
+                },
+            )
+
+        if artifact.build_success:
+            # 固化最后成功构建快照：后续失败的 build 重跑会把
+            # build_artifact.yaml/build.sh 覆盖成未验证的内容，poc/verify
+            # 检测到 build_success=false 时回读本快照。
+            self._write_yaml_file(
+                paths.build_dir / "last_good_build.yaml",
+                {
+                    "cve_id": cve_id,
+                    "saved_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+                    "artifact": artifact.model_dump(mode="json"),
+                },
+            )
 
         try:
             verify_payload = self._verify_build_artifact(
@@ -1890,6 +1971,9 @@ class BuildStage:
             "poc_artifacts_dir": "/workspace/artifacts/poc",
             "verify_artifacts_dir": "/workspace/artifacts/verify",
             "apt_packages": build_plan.install_packages,
+            "apt_proxy_fallback": self._docker_apt_proxy_fallback(),
+            "apt_proxy_fallback": self._docker_apt_proxy_fallback(),
+            "apt_proxy_fallback": self._docker_apt_proxy_fallback(),
         }
         script_context = {
             "project_name": plan_meta["project_name"],

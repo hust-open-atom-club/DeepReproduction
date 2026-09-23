@@ -80,10 +80,15 @@ ENV VERIFY_ARTIFACTS_DIR={{ verify_artifacts_dir }}
 ENV SRC_ROOT={{ src_root }}
 ENV PROJECT_DIR={{ project_dir }}
 
-RUN apt-get update && \
+RUN (apt-get update && \
     apt-get install -y --no-install-recommends {{ (apt_packages + extra_apt_packages) | join(" ") }} && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*) \
+{% if apt_proxy_fallback %}    || (apt-get -o Acquire::Retries=10 -o Acquire::http::Proxy={{ apt_proxy_fallback }} update && \
+    apt-get -o Acquire::Retries=10 -o Acquire::http::Proxy={{ apt_proxy_fallback }} install -y --no-install-recommends {{ (apt_packages + extra_apt_packages) | join(" ") }} && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*)
+{% endif %}
 
 RUN mkdir -p \
     "${SRC_ROOT}" \
