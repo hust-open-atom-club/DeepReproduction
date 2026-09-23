@@ -138,6 +138,8 @@ class BuildGraphState(TypedDict, total=False):
     outcome: BuildExecutionOutcome
     attempt: int
     should_retry: bool
+    recipe_attempts: int
+    recipe_retry_pending: bool
 
 
 class BuildFallbackSpec(BaseModel):
@@ -390,6 +392,7 @@ class BuildStage:
     )
     README_PATTERNS = ("README", "README.md", "README.txt", "INSTALL", "INSTALL.md")
     MAX_REPLAN_ATTEMPTS = 3
+    MAX_RECIPE_ATTEMPTS = 3
     MAX_LLM_NO_RESPONSE_RETRIES = 2
     DEFAULT_BASE_IMAGE = "ubuntu:20.04"
     MODERN_UBUNTU_BASE_IMAGE = "ubuntu:22.04"
@@ -509,6 +512,7 @@ class BuildStage:
             self._route_after_build_execute,
             {
                 "plan": "plan",
+                "execute": "execute",
                 "done": END,
             },
         )
@@ -562,6 +566,36 @@ class BuildStage:
                 "should_retry": False,
             }
 
+        # Tier 1: deterministic recipe recovery (does not consume LLM budget).
+        # run() 走的是内部子图而不是 plan_and_execute_build；配方必须接在这里，
+        # 否则 libtoolize/CRLF 等确定性修复在真实执行链上是死代码（lrzip 实证）。
+        recipe_attempts = state.get("recipe_attempts", 0)
+        if recipe_attempts < self.MAX_RECIPE_ATTEMPTS:
+            from app.stages.build_recovery import apply_build_recipes
+
+            recipe = apply_build_recipes(
+                outcome.artifact.build_logs,
+                outcome.artifact.build_script_content,
+            )
+            if recipe.changed:
+                patched_plan = current_plan.model_copy(
+                    update={
+                        "build_script_override": recipe.new_script,
+                        "rationale": (
+                            (current_plan.rationale or "")
+                            + f" [recipe-recovery: {', '.join(recipe.matched_kinds)}]"
+                        ).strip(),
+                    }
+                )
+                return {
+                    "current_plan": patched_plan,
+                    "outcome": outcome,
+                    "attempt": state.get("attempt", 0) + 1,
+                    "recipe_attempts": recipe_attempts + 1,
+                    "recipe_retry_pending": True,
+                    "should_retry": True,
+                }
+
         replanned, next_context = self._replan_from_failed_attempt(
             knowledge=state["knowledge"],
             context=state["current_context"],
@@ -574,6 +608,7 @@ class BuildStage:
             "current_plan": current_plan,
             "outcome": outcome,
             "attempt": state.get("attempt", 0) + 1,
+            "recipe_retry_pending": False,
             "should_retry": False,
         }
         if replanned is not None and next_context is not None:
@@ -590,6 +625,9 @@ class BuildStage:
             return "done"
         if outcome.artifact.build_success:
             return "done"
+        if state.get("recipe_retry_pending"):
+            # Tier-1 配方重试：同一 plan 只换 build 脚本，直接重执行。
+            return "execute"
         if attempt >= self.MAX_REPLAN_ATTEMPTS:
             return "done"
         if current_plan is None or not state.get("should_retry"):
